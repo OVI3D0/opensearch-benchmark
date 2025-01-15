@@ -55,9 +55,11 @@ def http_proxy():
 def fresh_log_file():
     cfg = it.ConfigFile(config_name=None)
     log_file = os.path.join(cfg.benchmark_home, "logs", "benchmark.log")
+    print("FRESH LOG_FILE: ", log_file)
 
     if os.path.exists(log_file):
         bak = os.path.join(tempfile.mkdtemp(), "benchmark.log")
+        print("BAK: ", bak)
         shutil.move(log_file, bak)
         yield log_file
         # append log lines to the original file and move it back to its original
