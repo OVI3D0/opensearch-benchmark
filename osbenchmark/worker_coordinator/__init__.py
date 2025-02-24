@@ -29,5 +29,6 @@ from .worker_coordinator import (
     PreparationComplete,
     StartBenchmark,
     BenchmarkComplete,
-    TaskFinished
+    TaskFinished,
+    FeedbackActor
 )

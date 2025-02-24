@@ -90,6 +90,7 @@ class BenchmarkActor(actor.BenchmarkActor):
         self.builder = None
         self.main_worker_coordinator = None
         self.coordinator = None
+        self.feedback_actor = None
 
     def receiveMsg_PoisonMessage(self, msg, sender):
         self.logger.info("BenchmarkActor got notified of poison message [%s] (forwarding).", (str(msg)))
@@ -119,12 +120,14 @@ class BenchmarkActor(actor.BenchmarkActor):
     def receiveMsg_EngineStarted(self, msg, sender):
         self.logger.info("Builder has started engine successfully.")
         self.coordinator.test_execution.provision_config_revision = msg.provision_config_revision
+        if self.cfg.opts("workload", "load.test.clients", mandatory=False):
+            self.feedback_actor = self.createActor(worker_coordinator.FeedbackActor)
         self.main_worker_coordinator = self.createActor(
             worker_coordinator.WorkerCoordinatorActor,
             targetActorRequirements={"coordinator": True}
             )
         self.logger.info("Telling worker_coordinator to prepare for benchmarking.")
-        self.send(self.main_worker_coordinator, worker_coordinator.PrepareBenchmark(self.cfg, self.coordinator.current_workload))
+        self.send(self.main_worker_coordinator, worker_coordinator.PrepareBenchmark(self.cfg, self.coordinator.current_workload, self.feedback_actor))
 
     @actor.no_retry("test execution orchestrator")  # pylint: disable=no-value-for-parameter
     def receiveMsg_PreparationComplete(self, msg, sender):

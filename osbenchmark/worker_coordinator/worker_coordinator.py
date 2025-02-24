@@ -56,13 +56,14 @@ class PrepareBenchmark:
     Initiates preparation steps for a benchmark. The benchmark should only be started after StartBenchmark is sent.
     """
 
-    def __init__(self, config, workload):
+    def __init__(self, config, workload, feedback_actor=None):
         """
         :param config: OSB internal configuration object.
         :param workload: The workload to use.
         """
         self.config = config
         self.workload = workload
+        self.feedback_actor = feedback_actor
 
 
 class StartBenchmark:
@@ -128,7 +129,7 @@ class StartWorker:
     Starts a worker.
     """
 
-    def __init__(self, worker_id, config, workload, client_allocations):
+    def __init__(self, worker_id, config, workload, client_allocations, feedback_actor=None):
         """
         :param worker_id: Unique (numeric) id of the worker.
         :param config: OSB internal configuration object.
@@ -139,6 +140,7 @@ class StartWorker:
         self.config = config
         self.workload = workload
         self.client_allocations = client_allocations
+        self.feedback_actor = feedback_actor
 
 
 class Drive:
@@ -199,13 +201,23 @@ class TaskFinished:
         self.next_task_scheduled_in = next_task_scheduled_in
 
 
+class FeedbackActor(actor.BenchmarkActor):
+    def __init__(self):
+        super().__init__()
+        self.messageStack = []
+    
+    def receiveUnrecognizedMessage(self, msg, sender):
+        print("Received RequestMetadata message")
+        self.messageStack.append(msg)
+        print(self.messageStack)
+
 class WorkerCoordinatorActor(actor.BenchmarkActor):
     RESET_RELATIVE_TIME_MARKER = "reset_relative_time"
 
     WAKEUP_INTERVAL_SECONDS = 1
 
     # post-process request metrics every N seconds and send it to the metrics store
-    POST_PROCESS_INTERVAL_SECONDS = 30
+    POST_PROCESS_INTERVAL_SECONDS = 5
 
     """
     Coordinates all workers. This is actually only a thin actor wrapper layer around ``WorkerCoordinator`` which does the actual work.
@@ -218,6 +230,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.status = "init"
         self.post_process_timer = 0
         self.cluster_details = None
+        self.feedback_actor = None
 
     def receiveMsg_PoisonMessage(self, poisonmsg, sender):
         self.logger.error("Main worker_coordinator received a fatal indication from load generator (%s). Shutting down.", poisonmsg.details)
@@ -258,6 +271,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.start_sender = sender
         self.coordinator = WorkerCoordinator(self, msg.config)
         self.coordinator.prepare_benchmark(msg.workload)
+        self.feedback_actor = msg.feedback_actor
 
     @actor.no_retry("worker_coordinator")  # pylint: disable=no-value-for-parameter
     def receiveMsg_StartBenchmark(self, msg, sender):
@@ -342,6 +356,12 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
 
     def on_benchmark_complete(self, metrics):
         self.send(self.start_sender, BenchmarkComplete(metrics))
+    
+    def send_feedback(self, feedback):
+        try:
+            self.send(self.feedback_actor, feedback)
+        except Exception as e:
+            print(f"Failed to send metadata to FeedbackActor: {e}")
 
 
 def load_local_config(coordinator_config):
@@ -835,7 +855,9 @@ class WorkerCoordinator:
         # only a snapshot and that new data will go to a new sample set.
         raw_samples = self.raw_samples
         self.raw_samples = []
-        self.sample_post_processor(raw_samples)
+        feedback = self.sample_post_processor(raw_samples)
+        if feedback:
+            self.target.send_feedback(feedback)
 
 
 class SamplePostprocessor:
@@ -846,6 +868,7 @@ class SamplePostprocessor:
         self.test_procedure_meta_data = test_procedure_meta_data
         self.throughput_calculator = ThroughputCalculator()
         self.downsample_factor = downsample_factor
+        self.feedback = []
 
     def __call__(self, raw_samples):
         if len(raw_samples) == 0:
@@ -862,7 +885,8 @@ class SamplePostprocessor:
                 sample.task.meta_data,
                 sample.request_meta_data,
             )
-
+            self.feedback.append((sample.request_meta_data, sample.latency))
+            # print(self.feedback)
             # if request_meta_data exists then it will have {"success": true/false} as a parameter.
             if sample.request_meta_data and len(sample.request_meta_data) > 1:
                 self.logger.debug("Found: %s", sample.request_meta_data)
@@ -931,7 +955,14 @@ class SamplePostprocessor:
                                                                operation=timing.operation_name, operation_type=timing.operation_type,
                                                                sample_type=timing.sample_type, absolute_time=timing.absolute_time,
                                                                relative_time=timing.relative_time, meta_data=meta_data)
-
+        # if self.feedback_actor:
+        #     # print(self.feedback_actor)
+        #     try:
+        #         self.send_message(self.feedback_actor, RequestMetadata(sample.request_meta_data))
+        #     except Exception as e:
+        #         print(f"Failed to send metadata to FeedbackActor: {e}")
+        feedback = self.feedback
+        self.feedback = []
         end = time.perf_counter()
         self.logger.debug("Storing latency and service time took [%f] seconds.", (end - start))
         start = end
@@ -965,6 +996,7 @@ class SamplePostprocessor:
         self.logger.debug("Flushing the metrics store took [%f] seconds.", (end - start))
         self.logger.debug("Postprocessing [%d] raw samples (downsampled to [%d] samples) took [%f] seconds in total.",
                           len(raw_samples), final_sample_count, (end - total_start))
+        return feedback
 
     def merge(self, *args):
         result = {}
@@ -1090,6 +1122,7 @@ class Worker(actor.BenchmarkActor):
         self.client_allocations = msg.client_allocations
         self.current_task_index = 0
         self.cancel.clear()
+        self.feedback_actor = msg.feedback_actor
         # we need to wake up more often in test mode
         if self.config.opts("workload", "test.mode.enabled"):
             self.wakeup_interval = 0.5
@@ -1530,7 +1563,6 @@ class AsyncIoAdapter:
         client_count = len(self.task_allocations)
         opensearch = os_clients(self.cfg.opts("client", "hosts").all_hosts,
                         self.cfg.opts("client", "options").with_max_connections(client_count))
-
         self.logger.info("Task assertions enabled: %s", str(self.assertions_enabled))
         runner.enable_assertions(self.assertions_enabled)
 
@@ -1602,7 +1634,6 @@ class AsyncProfiler:
             profile += s.getvalue()
             profile += "=== Profile END ==="
             self.profile_logger.info(profile)
-
 
 class AsyncExecutor:
     def __init__(self, client_id, task, schedule, opensearch, sampler, cancel, complete, on_error, config=None):
