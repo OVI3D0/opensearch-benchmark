@@ -35,6 +35,7 @@ import queue
 import threading
 from dataclasses import dataclass
 from typing import Callable
+from multiprocessing import Manager
 
 import time
 from enum import Enum
@@ -129,7 +130,7 @@ class StartWorker:
     Starts a worker.
     """
 
-    def __init__(self, worker_id, config, workload, client_allocations, feedback_actor=None):
+    def __init__(self, worker_id, config, workload, client_allocations, shared_states, feedback_actor=None):
         """
         :param worker_id: Unique (numeric) id of the worker.
         :param config: OSB internal configuration object.
@@ -141,6 +142,7 @@ class StartWorker:
         self.workload = workload
         self.client_allocations = client_allocations
         self.feedback_actor = feedback_actor
+        self.shared_states = shared_states
 
 
 class Drive:
@@ -205,11 +207,21 @@ class FeedbackActor(actor.BenchmarkActor):
     def __init__(self):
         super().__init__()
         self.messageStack = []
+        self.shared_client_states = None
     
+    def receiveMsg_dict(self, msg, sender):
+        self.shared_client_states = msg
+
     def receiveUnrecognizedMessage(self, msg, sender):
-        print("Received RequestMetadata message")
         self.messageStack.append(msg)
-        print(self.messageStack)
+        # Properly update the nested dictionary
+        data_dict = self.shared_client_states['data']
+        for i in range(0, 10):
+            if i in data_dict:
+                data_dict[i] = not data_dict[i]
+        # print("Current client map: ", self.shared_client_states.get('data'))
+    
+
 
 class WorkerCoordinatorActor(actor.BenchmarkActor):
     RESET_RELATIVE_TIME_MARKER = "reset_relative_time"
@@ -217,7 +229,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
     WAKEUP_INTERVAL_SECONDS = 1
 
     # post-process request metrics every N seconds and send it to the metrics store
-    POST_PROCESS_INTERVAL_SECONDS = 5
+    POST_PROCESS_INTERVAL_SECONDS = 10
 
     """
     Coordinates all workers. This is actually only a thin actor wrapper layer around ``WorkerCoordinator`` which does the actual work.
@@ -231,6 +243,10 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.post_process_timer = 0
         self.cluster_details = None
         self.feedback_actor = None
+        self.manager = Manager()
+        self.shared_client_states = self.manager.dict({
+            'data': self.manager.dict()
+        })
 
     def receiveMsg_PoisonMessage(self, poisonmsg, sender):
         self.logger.error("Main worker_coordinator received a fatal indication from load generator (%s). Shutting down.", poisonmsg.details)
@@ -272,6 +288,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.coordinator = WorkerCoordinator(self, msg.config)
         self.coordinator.prepare_benchmark(msg.workload)
         self.feedback_actor = msg.feedback_actor
+        self.send(self.feedback_actor, self.shared_client_states)
 
     @actor.no_retry("worker_coordinator")  # pylint: disable=no-value-for-parameter
     def receiveMsg_StartBenchmark(self, msg, sender):
@@ -308,7 +325,11 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         return self.createActor(Worker, targetActorRequirements=self._requirements(host))
 
     def start_worker(self, worker_coordinator, worker_id, cfg, workload, allocations):
-        self.send(worker_coordinator, StartWorker(worker_id, cfg, workload, allocations))
+        for allocation in allocations.allocations:
+            client_id = allocation["client_id"]
+            self.shared_client_states['data'][client_id] = True
+        self.send(self.feedback_actor, self.shared_client_states)
+        self.send(worker_coordinator, StartWorker(worker_id, cfg, workload, allocations, self.shared_client_states))
 
     def drive_at(self, worker_coordinator, client_start_timestamp):
         self.send(worker_coordinator, Drive(client_start_timestamp))
@@ -1108,6 +1129,7 @@ class Worker(actor.BenchmarkActor):
         self.start_driving = False
         self.wakeup_interval = Worker.WAKEUP_INTERVAL_SECONDS
         self.sample_queue_size = None
+        self.shared_states = None
 
     @actor.no_retry("worker")  # pylint: disable=no-value-for-parameter
     def receiveMsg_StartWorker(self, msg, sender):
@@ -1123,6 +1145,7 @@ class Worker(actor.BenchmarkActor):
         self.current_task_index = 0
         self.cancel.clear()
         self.feedback_actor = msg.feedback_actor
+        self.shared_states = msg.shared_states
         # we need to wake up more often in test mode
         if self.config.opts("workload", "test.mode.enabled"):
             self.wakeup_interval = 0.5
@@ -1250,7 +1273,7 @@ class Worker(actor.BenchmarkActor):
                 self.logger.info("Worker[%d] is executing tasks at index [%d].", self.worker_id, self.current_task_index)
                 self.sampler = Sampler(start_timestamp=time.perf_counter(), buffer_size=self.sample_queue_size)
                 executor = AsyncIoAdapter(self.config, self.workload, task_allocations, self.sampler,
-                                          self.cancel, self.complete, self.on_error)
+                                          self.cancel, self.complete, self.on_error, self.shared_states)
 
                 self.executor_future = self.pool.submit(executor)
                 self.wakeupAfter(datetime.timedelta(seconds=self.wakeup_interval))
@@ -1519,7 +1542,7 @@ class ThroughputCalculator:
 
 
 class AsyncIoAdapter:
-    def __init__(self, cfg, workload, task_allocations, sampler, cancel, complete, abort_on_error):
+    def __init__(self, cfg, workload, task_allocations, sampler, cancel, complete, abort_on_error, shared_states):
         self.cfg = cfg
         self.workload = workload
         self.task_allocations = task_allocations
@@ -1531,6 +1554,7 @@ class AsyncIoAdapter:
         self.assertions_enabled = self.cfg.opts("worker_coordinator", "assertions")
         self.debug_event_loop = self.cfg.opts("system", "async.debug", mandatory=False, default_value=False)
         self.logger = logging.getLogger(__name__)
+        self.shared_states = shared_states
 
     def __call__(self, *args, **kwargs):
         # only possible in Python 3.7+ (has introduced get_running_loop)
@@ -1585,7 +1609,7 @@ class AsyncIoAdapter:
             schedule = schedule_for(task_allocation, params_per_task[task])
             async_executor = AsyncExecutor(
                 client_id, task, schedule, opensearch, self.sampler, self.cancel, self.complete,
-                task.error_behavior(self.abort_on_error), self.cfg)
+                task.error_behavior(self.abort_on_error), self.cfg, self.shared_states)
             final_executor = AsyncProfiler(async_executor) if self.profiling_enabled else async_executor
             aws.append(final_executor())
         run_start = time.perf_counter()
@@ -1636,7 +1660,7 @@ class AsyncProfiler:
             self.profile_logger.info(profile)
 
 class AsyncExecutor:
-    def __init__(self, client_id, task, schedule, opensearch, sampler, cancel, complete, on_error, config=None):
+    def __init__(self, client_id, task, schedule, opensearch, sampler, cancel, complete, on_error, config=None, shared_states=None):
         """
         Executes tasks according to the schedule for a given operation.
 
@@ -1659,6 +1683,7 @@ class AsyncExecutor:
         self.on_error = on_error
         self.logger = logging.getLogger(__name__)
         self.cfg = config
+        self.shared_states = shared_states
 
     async def __call__(self, *args, **kwargs):
         task_completes_parent = self.task.completes_parent
@@ -1682,6 +1707,22 @@ class AsyncExecutor:
                 if self.cancel.is_set():
                     self.logger.info("User cancelled execution.")
                     break
+                
+                # Check client state before executing
+                if not self.shared_states.get('data', {}).get(self.client_id, True):
+                    self.logger.info("Client id [%s] is paused.", self.client_id)
+                    pause_start = time.perf_counter()
+                    # Keep checking the state every second until we're unpaused
+                    while not self.shared_states.get('data', {}).get(self.client_id, True):
+                        await asyncio.sleep(1)
+                    
+                    # Calculate pause duration and adjust total_start
+                    pause_duration = time.perf_counter() - pause_start
+                    total_start += pause_duration
+                    self.logger.info("Client id [%s] is resuming after %.2f seconds.", 
+                                   self.client_id, pause_duration)
+                    continue
+
                 absolute_expected_schedule_time = total_start + expected_scheduled_time
                 throughput_throttled = expected_scheduled_time > 0
                 if throughput_throttled:
@@ -1692,6 +1733,11 @@ class AsyncExecutor:
                 absolute_processing_start = time.time()
                 processing_start = time.perf_counter()
                 self.schedule_handle.before_request(processing_start)
+
+                if not self.shared_states.get('data', {}).get(self.client_id, True):
+                    self.logger.info("Client id [%s] was paused before making request.", self.client_id)
+                    continue
+
                 async with self.opensearch["default"].new_request_context() as request_context:
                     # add num_clients to the parameter so that vector search runner can skip calculating recall
                     # if num_clients > cpu_count().
@@ -1706,6 +1752,8 @@ class AsyncExecutor:
                     request_end = request_context.request_end
                     client_request_start = request_context.client_request_start
                     client_request_end = request_context.client_request_end
+                    if self.client_id == 0:
+                        self.logger.info("Client ID [%d] just sent a request. Request metadata: [%s]", self.client_id, request_meta_data)
 
                 processing_end = time.perf_counter()
                 service_time = request_end - request_start
