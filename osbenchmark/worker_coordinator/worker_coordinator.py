@@ -130,7 +130,7 @@ class StartWorker:
     Starts a worker.
     """
 
-    def __init__(self, worker_id, config, workload, client_allocations, shared_states, feedback_actor=None):
+    def __init__(self, worker_id, config, workload, client_allocations, feedback_actor=None):
         """
         :param worker_id: Unique (numeric) id of the worker.
         :param config: OSB internal configuration object.
@@ -142,7 +142,6 @@ class StartWorker:
         self.workload = workload
         self.client_allocations = client_allocations
         self.feedback_actor = feedback_actor
-        self.shared_states = shared_states
 
 
 class Drive:
@@ -206,11 +205,30 @@ class TaskFinished:
 class FeedbackActor(actor.BenchmarkActor):
     def __init__(self):
         super().__init__()
-        self.messageStack = []
-        self.shared_client_states = None
+        self.messageQueue = []
+        self.shared_client_states = {}
     
     def receiveMsg_dict(self, msg, sender):
-        self.shared_client_states = msg
+        if not isinstance(msg, dict):
+            print("Received message is not a dictionary: %s", msg)
+            return
+        
+        if 'data' not in msg:
+            print("Received message does not contain 'data' key: %s", msg)
+            return
+        
+        try:
+            self.shared_client_states[msg['worker_id']] = msg['data']
+            # print(self.shared_client_states)
+        except Exception as e:
+            print("Error processing client states: %s", e)
+        finally:
+            print(self.shared_client_states)
+            # print("Received client states: %s", msg)
+
+    def receiveMsg_clusterError(self, msg, sender):
+        self.messageQueue.append(msg)
+        self.logger.error("Received cluster error message: %s", msg)
 
     def receiveUnrecognizedMessage(self, msg, sender):
         self.messageStack.append(msg)
@@ -229,7 +247,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
     WAKEUP_INTERVAL_SECONDS = 1
 
     # post-process request metrics every N seconds and send it to the metrics store
-    POST_PROCESS_INTERVAL_SECONDS = 10
+    POST_PROCESS_INTERVAL_SECONDS = 30
 
     """
     Coordinates all workers. This is actually only a thin actor wrapper layer around ``WorkerCoordinator`` which does the actual work.
@@ -243,10 +261,6 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.post_process_timer = 0
         self.cluster_details = None
         self.feedback_actor = None
-        self.manager = Manager()
-        self.shared_client_states = self.manager.dict({
-            'data': self.manager.dict()
-        })
 
     def receiveMsg_PoisonMessage(self, poisonmsg, sender):
         self.logger.error("Main worker_coordinator received a fatal indication from load generator (%s). Shutting down.", poisonmsg.details)
@@ -288,7 +302,6 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.coordinator = WorkerCoordinator(self, msg.config)
         self.coordinator.prepare_benchmark(msg.workload)
         self.feedback_actor = msg.feedback_actor
-        self.send(self.feedback_actor, self.shared_client_states)
 
     @actor.no_retry("worker_coordinator")  # pylint: disable=no-value-for-parameter
     def receiveMsg_StartBenchmark(self, msg, sender):
@@ -325,11 +338,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         return self.createActor(Worker, targetActorRequirements=self._requirements(host))
 
     def start_worker(self, worker_coordinator, worker_id, cfg, workload, allocations):
-        for allocation in allocations.allocations:
-            client_id = allocation["client_id"]
-            self.shared_client_states['data'][client_id] = True
-        self.send(self.feedback_actor, self.shared_client_states)
-        self.send(worker_coordinator, StartWorker(worker_id, cfg, workload, allocations, self.shared_client_states))
+        self.send(worker_coordinator, StartWorker(worker_id, cfg, workload, allocations, self.feedback_actor))
 
     def drive_at(self, worker_coordinator, client_start_timestamp):
         self.send(worker_coordinator, Drive(client_start_timestamp))
@@ -378,11 +387,13 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
     def on_benchmark_complete(self, metrics):
         self.send(self.start_sender, BenchmarkComplete(metrics))
     
-    def send_feedback(self, feedback):
-        try:
-            self.send(self.feedback_actor, feedback)
-        except Exception as e:
-            print(f"Failed to send metadata to FeedbackActor: {e}")
+    # send feedback to feedback actor - don't think we need this
+    # def send_feedback(self, feedback):
+    #     if self.feedback_actor:
+    #         try:
+    #             self.send(self.feedback_actor, feedback)
+    #         except Exception as e:
+    #             print(f"Failed to send metadata to FeedbackActor: {e}")
 
 
 def load_local_config(coordinator_config):
@@ -663,6 +674,16 @@ class WorkerCoordinator:
 
         os_clients = self.create_os_clients()
 
+        if self.config.opts("workload", "load.test.clients", mandatory=False):
+            manager = Manager()
+            shared_dict = manager.dict()
+            self.shared_states = {
+                "worker_id": None,  # This will be set per worker
+                "data": shared_dict
+            }
+        else:
+            self.shared_states = None
+
         skip_rest_api_check = self.config.opts("builder", "skip.rest.api.check")
         uses_static_responses = self.config.opts("client", "options").uses_static_responses
         if skip_rest_api_check:
@@ -877,8 +898,9 @@ class WorkerCoordinator:
         raw_samples = self.raw_samples
         self.raw_samples = []
         feedback = self.sample_post_processor(raw_samples)
-        if feedback:
-            self.target.send_feedback(feedback)
+        # Send feedback to feedback actor - i don't think we need this
+        # if feedback:
+        #     self.target.send_feedback(feedback)
 
 
 class SamplePostprocessor:
@@ -976,12 +998,7 @@ class SamplePostprocessor:
                                                                operation=timing.operation_name, operation_type=timing.operation_type,
                                                                sample_type=timing.sample_type, absolute_time=timing.absolute_time,
                                                                relative_time=timing.relative_time, meta_data=meta_data)
-        # if self.feedback_actor:
-        #     # print(self.feedback_actor)
-        #     try:
-        #         self.send_message(self.feedback_actor, RequestMetadata(sample.request_meta_data))
-        #     except Exception as e:
-        #         print(f"Failed to send metadata to FeedbackActor: {e}")
+
         feedback = self.feedback
         self.feedback = []
         end = time.perf_counter()
@@ -1129,6 +1146,7 @@ class Worker(actor.BenchmarkActor):
         self.start_driving = False
         self.wakeup_interval = Worker.WAKEUP_INTERVAL_SECONDS
         self.sample_queue_size = None
+        self.manager = None
         self.shared_states = None
 
     @actor.no_retry("worker")  # pylint: disable=no-value-for-parameter
@@ -1145,13 +1163,29 @@ class Worker(actor.BenchmarkActor):
         self.current_task_index = 0
         self.cancel.clear()
         self.feedback_actor = msg.feedback_actor
-        self.shared_states = msg.shared_states
+
         # we need to wake up more often in test mode
         if self.config.opts("workload", "test.mode.enabled"):
             self.wakeup_interval = 0.5
         runner.register_default_runners()
         if self.workload.has_plugins:
             workload.load_workload_plugins(self.config, self.workload.name, runner.register_runner, scheduler.register_scheduler)
+
+        if self.config.opts("workload", "load.test.clients", mandatory=False):
+            self.manager = Manager()
+            self.shared_states = {
+                "worker_id": msg.worker_id,
+                "data": self.manager.dict()
+            }
+            # Initialize client states
+            for allocation in msg.client_allocations.allocations:
+                client_id = allocation["client_id"]
+                self.shared_states["data"][client_id] = True
+            
+            # Send initial state to feedback actor
+            if self.feedback_actor:
+                self.send(self.feedback_actor, self.shared_states)
+
         self.drive()
 
     @actor.no_retry("worker")  # pylint: disable=no-value-for-parameter
@@ -1237,6 +1271,7 @@ class Worker(actor.BenchmarkActor):
         if self.executor_future is not None and self.executor_future.running():
             self.cancel.set()
         self.pool.shutdown()
+        self.manager.shutdown()
         self.logger.info("Worker[%s] is exiting due to ActorExitRequest.", str(self.worker_id))
 
     def receiveMsg_BenchmarkFailure(self, msg, sender):
@@ -1542,7 +1577,7 @@ class ThroughputCalculator:
 
 
 class AsyncIoAdapter:
-    def __init__(self, cfg, workload, task_allocations, sampler, cancel, complete, abort_on_error, shared_states):
+    def __init__(self, cfg, workload, task_allocations, sampler, cancel, complete, abort_on_error, client_states):
         self.cfg = cfg
         self.workload = workload
         self.task_allocations = task_allocations
@@ -1554,7 +1589,7 @@ class AsyncIoAdapter:
         self.assertions_enabled = self.cfg.opts("worker_coordinator", "assertions")
         self.debug_event_loop = self.cfg.opts("system", "async.debug", mandatory=False, default_value=False)
         self.logger = logging.getLogger(__name__)
-        self.shared_states = shared_states
+        self.client_states = client_states
 
     def __call__(self, *args, **kwargs):
         # only possible in Python 3.7+ (has introduced get_running_loop)
@@ -1609,7 +1644,7 @@ class AsyncIoAdapter:
             schedule = schedule_for(task_allocation, params_per_task[task])
             async_executor = AsyncExecutor(
                 client_id, task, schedule, opensearch, self.sampler, self.cancel, self.complete,
-                task.error_behavior(self.abort_on_error), self.cfg, self.shared_states)
+                task.error_behavior(self.abort_on_error), self.cfg, self.client_states)
             final_executor = AsyncProfiler(async_executor) if self.profiling_enabled else async_executor
             aws.append(final_executor())
         run_start = time.perf_counter()
@@ -1660,7 +1695,7 @@ class AsyncProfiler:
             self.profile_logger.info(profile)
 
 class AsyncExecutor:
-    def __init__(self, client_id, task, schedule, opensearch, sampler, cancel, complete, on_error, config=None, shared_states=None):
+    def __init__(self, client_id, task, schedule, opensearch, sampler, cancel, complete, on_error, config=None, client_states=None):
         """
         Executes tasks according to the schedule for a given operation.
 
@@ -1683,7 +1718,7 @@ class AsyncExecutor:
         self.on_error = on_error
         self.logger = logging.getLogger(__name__)
         self.cfg = config
-        self.shared_states = shared_states
+        self.shared_states = client_states
 
     async def __call__(self, *args, **kwargs):
         task_completes_parent = self.task.completes_parent
@@ -1709,17 +1744,24 @@ class AsyncExecutor:
                     break
                 
                 # Check client state before executing
-                if not self.shared_states.get('data', {}).get(self.client_id, True):
-                    self.logger.info("Client id [%s] is paused.", self.client_id)
+                client_state = True
+                if self.shared_states and 'data' in self.shared_states:
+                    try:
+                        client_state = self.shared_states['data'].get(self.client_id, True)
+                    except Exception as e:
+                        print(f"Error checking client state: {e}")
+                
+                if not client_state:
+                    print("Client id [%s] is paused.", self.client_id)
                     pause_start = time.perf_counter()
+                    
                     # Keep checking the state every second until we're unpaused
-                    while not self.shared_states.get('data', {}).get(self.client_id, True):
+                    while not self.shared_states['data'].get(self.client_id, True):
                         await asyncio.sleep(1)
                     
-                    # Calculate pause duration and adjust total_start
                     pause_duration = time.perf_counter() - pause_start
                     total_start += pause_duration
-                    self.logger.info("Client id [%s] is resuming after %.2f seconds.", 
+                    print("Client id [%s] is resuming after %.2f seconds.", 
                                    self.client_id, pause_duration)
                     continue
 
@@ -1734,7 +1776,7 @@ class AsyncExecutor:
                 processing_start = time.perf_counter()
                 self.schedule_handle.before_request(processing_start)
 
-                if not self.shared_states.get('data', {}).get(self.client_id, True):
+                if self.shared_states and not client_state:
                     self.logger.info("Client id [%s] was paused before making request.", self.client_id)
                     continue
 
@@ -1752,6 +1794,8 @@ class AsyncExecutor:
                     request_end = request_context.request_end
                     client_request_start = request_context.client_request_start
                     client_request_end = request_context.client_request_end
+                    if request_meta_data['success'] is not True:
+                        self.logger.error("Request metadata: [%s]", request_meta_data)
                     if self.client_id == 0:
                         self.logger.info("Client ID [%d] just sent a request. Request metadata: [%s]", self.client_id, request_meta_data)
 
