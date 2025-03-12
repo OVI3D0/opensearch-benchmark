@@ -201,43 +201,107 @@ class TaskFinished:
         self.metrics = metrics
         self.next_task_scheduled_in = next_task_scheduled_in
 
+class ClusterErrorMessage:
+    """Message sent when a request fails"""
+    def __init__(self, client_id, request_metadata):
+        self.client_id = client_id
+        self.request_metadata = request_metadata
+
+class FeedbackState(Enum):
+    NORMAL = "normal"
+    SCALING = "scaling"
+    SLEEP = "sleep"
 
 class FeedbackActor(actor.BenchmarkActor):
+    POST_SCALEDOWN_SECONDS = 30
+
     def __init__(self):
         super().__init__()
+        self.state = FeedbackState.NORMAL
         self.messageQueue = []
         self.shared_client_states = {}
+        self.total_client_count = 0
+        self.sleep_start_time = None
+        print("Feedback actor initialized")
     
+    def scale_down(self):
+        print("Considering scale down...")
+        # scale down while blocking new messages
+        if self.state == FeedbackState.SLEEP:
+            time_elapsed = time.time() - self.sleep_start_time
+            if time_elapsed < self.POST_SCALEDOWN_SECONDS:
+                print(f"Sleeping for {self.POST_SCALEDOWN_SECONDS - time_elapsed} more seconds")
+                return
+        
+        print("scaling down...")
+        self.scaledown_timer = 0
+        self.state = FeedbackState.SCALING
+        try:
+            # calculate new client count - cut off 10% for now
+            clients_to_pause = int(self.total_client_count * 0.05)
+            all_clients = []
+            # perform scale down logic
+            for worker_id, client_states in self.shared_client_states.items():
+                for client_id in client_states.keys():
+                    all_clients.append((worker_id, client_id))
+            all_clients.sort()
+
+            clients_selected = all_clients[:clients_to_pause]
+
+            # group selected clients by worker for efficient updating
+            updates_by_worker = {}
+            for worker_id, client_id in clients_selected:
+                if worker_id not in updates_by_worker:
+                    updates_by_worker[worker_id] = []
+                updates_by_worker[worker_id].append(client_id)
+            
+            # update the pause status for selected clients
+            clients_paused = 0
+            for worker_id, client_ids in updates_by_worker.items():
+                for client_id in client_ids:
+                    self.shared_client_states[worker_id][client_id] = False
+                    clients_paused += 1
+                    self.total_client_count -= 1
+                    # print(f"Client {client_id} paused on worker {worker_id}")
+            
+            print("Scaling down complete. Paused [%d] clients", clients_paused)
+
+        finally:
+            # drop any messages since we've been scaling
+            self.messageQueue = []
+            self.state = FeedbackState.SLEEP
+            self.sleep_start_time = time.time()
+
+    def receiveMsg_WakeupMessage(self, msg, sender):
+        """
+        Received by this same FeedbackActor every SCALEDOWN_WAKEUP_INTERVAL_SECONDS
+        to increment the timer
+        """
+        if self.state == FeedbackState.NORMAL:
+            self.scaledown_timer += self.SCALEDOWN_WAKEUP_INTERVAL_SECONDS
+            # Schedule next wakeup
+            self.wakeupAfter(datetime.timedelta(seconds=self.SCALEDOWN_WAKEUP_INTERVAL_SECONDS))
+
+    def receiveMsg_ClusterErrorMessage(self, msg, sender):
+        print("received cluster error msg")
+        if self.state == FeedbackState.SCALING:
+            # ignore errors during scaling
+            return
+        else:
+            # scale down
+            self.messageQueue.append(msg)
+            self.scale_down()
+
     def receiveMsg_dict(self, msg, sender):
-        if not isinstance(msg, dict):
-            print("Received message is not a dictionary: %s", msg)
-            return
-        
-        if 'data' not in msg:
-            print("Received message does not contain 'data' key: %s", msg)
-            return
-        
+        print(f"received dict message {msg} from {sender}")
         try:
             self.shared_client_states[msg['worker_id']] = msg['data']
-            # print(self.shared_client_states)
+            self.total_client_count += len(msg['data'])
         except Exception as e:
             print("Error processing client states: %s", e)
-        finally:
-            print(self.shared_client_states)
-            # print("Received client states: %s", msg)
-
-    def receiveMsg_clusterError(self, msg, sender):
-        self.messageQueue.append(msg)
-        self.logger.error("Received cluster error message: %s", msg)
 
     def receiveUnrecognizedMessage(self, msg, sender):
-        self.messageStack.append(msg)
-        # Properly update the nested dictionary
-        data_dict = self.shared_client_states['data']
-        for i in range(0, 10):
-            if i in data_dict:
-                data_dict[i] = not data_dict[i]
-        # print("Current client map: ", self.shared_client_states.get('data'))
+        print("Received unrecognized message: %s", msg)
     
 
 
@@ -247,7 +311,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
     WAKEUP_INTERVAL_SECONDS = 1
 
     # post-process request metrics every N seconds and send it to the metrics store
-    POST_PROCESS_INTERVAL_SECONDS = 30
+    POST_PROCESS_INTERVAL_SECONDS = 10
 
     """
     Coordinates all workers. This is actually only a thin actor wrapper layer around ``WorkerCoordinator`` which does the actual work.
@@ -1308,7 +1372,8 @@ class Worker(actor.BenchmarkActor):
                 self.logger.info("Worker[%d] is executing tasks at index [%d].", self.worker_id, self.current_task_index)
                 self.sampler = Sampler(start_timestamp=time.perf_counter(), buffer_size=self.sample_queue_size)
                 executor = AsyncIoAdapter(self.config, self.workload, task_allocations, self.sampler,
-                                          self.cancel, self.complete, self.on_error, self.shared_states)
+                                          self.cancel, self.complete, self.on_error, self.shared_states, send_fn=self.send,
+                                          feedback_actor=self.feedback_actor)
 
                 self.executor_future = self.pool.submit(executor)
                 self.wakeupAfter(datetime.timedelta(seconds=self.wakeup_interval))
@@ -1577,7 +1642,7 @@ class ThroughputCalculator:
 
 
 class AsyncIoAdapter:
-    def __init__(self, cfg, workload, task_allocations, sampler, cancel, complete, abort_on_error, client_states):
+    def __init__(self, cfg, workload, task_allocations, sampler, cancel, complete, abort_on_error, client_states, send_fn=None, feedback_actor=None):
         self.cfg = cfg
         self.workload = workload
         self.task_allocations = task_allocations
@@ -1590,6 +1655,8 @@ class AsyncIoAdapter:
         self.debug_event_loop = self.cfg.opts("system", "async.debug", mandatory=False, default_value=False)
         self.logger = logging.getLogger(__name__)
         self.client_states = client_states
+        self.send_fn = send_fn
+        self.feedback_actor = feedback_actor
 
     def __call__(self, *args, **kwargs):
         # only possible in Python 3.7+ (has introduced get_running_loop)
@@ -1644,7 +1711,7 @@ class AsyncIoAdapter:
             schedule = schedule_for(task_allocation, params_per_task[task])
             async_executor = AsyncExecutor(
                 client_id, task, schedule, opensearch, self.sampler, self.cancel, self.complete,
-                task.error_behavior(self.abort_on_error), self.cfg, self.client_states)
+                task.error_behavior(self.abort_on_error), self.cfg, self.client_states, self.send_fn, self.feedback_actor)
             final_executor = AsyncProfiler(async_executor) if self.profiling_enabled else async_executor
             aws.append(final_executor())
         run_start = time.perf_counter()
@@ -1695,7 +1762,8 @@ class AsyncProfiler:
             self.profile_logger.info(profile)
 
 class AsyncExecutor:
-    def __init__(self, client_id, task, schedule, opensearch, sampler, cancel, complete, on_error, config=None, client_states=None):
+    def __init__(self, client_id, task, schedule, opensearch, sampler, cancel, complete, on_error, config=None, client_states=None,
+                send_fn=None, feedback_actor=None):
         """
         Executes tasks according to the schedule for a given operation.
 
@@ -1719,6 +1787,8 @@ class AsyncExecutor:
         self.logger = logging.getLogger(__name__)
         self.cfg = config
         self.shared_states = client_states
+        self.send_fn = send_fn
+        self.feedback_actor = feedback_actor
 
     async def __call__(self, *args, **kwargs):
         task_completes_parent = self.task.completes_parent
@@ -1790,6 +1860,17 @@ class AsyncExecutor:
                             params.update({"num_clients": self.task.clients, "num_cores": available_cores})
 
                     total_ops, total_ops_unit, request_meta_data = await execute_single(runner, self.opensearch, params, self.on_error)
+                    if request_meta_data['success'] is not True:
+                        error_msg = ClusterErrorMessage(
+                            client_id=self.client_id,
+                            request_metadata=request_meta_data
+                        )
+                        try:
+                            print("Attempting to send message")
+                            self.send_fn(self.feedback_actor, error_msg)
+                        except Exception as e:
+                            print(f"Error sending error message: {e}")
+
                     request_start = request_context.request_start
                     request_end = request_context.request_end
                     client_request_start = request_context.client_request_start
@@ -1882,6 +1963,7 @@ async def execute_single(runner, opensearch, params, on_error):
             total_ops = 1
             total_ops_unit = "ops"
             request_meta_data = {"success": True}
+    # TODO: send error to feedback actor?
     except opensearchpy.TransportError as e:
         request_context_holder.on_client_request_end()
         # we *specifically* want to distinguish connection refused (a node died?) from connection timeouts
