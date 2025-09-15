@@ -2300,7 +2300,7 @@ class AsyncExecutor:
             return context_manager
 
     async def _execute_request(self, params: dict, expected_scheduled_time: float, total_start: float,
-                               client_state: bool, request_context: dict = None) -> dict:
+                               client_state: bool, execution_context: dict = None) -> dict:
         """Execute a request with timing control and error handling."""
         request_timeout = (params or {}).get("request-timeout", None)
         absolute_expected_schedule_time = total_start + expected_scheduled_time
@@ -2321,8 +2321,8 @@ class AsyncExecutor:
         total_ops, total_ops_unit, request_meta_data = 0, "ops", {}
         async with context_manager as request_context:
             try:
-                # Use runner from request context if concurrent execution, otherwise use instance variable
-                runner = request_context.get('runner') if request_context else self.runner
+                # Use runner from execution context if concurrent execution, otherwise use instance variable
+                runner = execution_context.get('runner') if execution_context else self.runner
                 total_ops, total_ops_unit, request_meta_data = await asyncio.wait_for(
                     execute_single(
                         runner, self.opensearch, params, self.on_error,
@@ -2385,7 +2385,7 @@ class AsyncExecutor:
 
     def _process_results(self, result_data: dict, total_start: float, client_state: bool,
                          percent_completed: float, add_profile_metric_sample: bool = False,
-                         request_context: dict = None) -> bool:
+                         execution_context: dict = None) -> bool:
         """Process results from a request."""
         # Handle cases where the request was skipped (no-op)
         if result_data["request_meta_data"].get("skipped_request"):
@@ -2408,13 +2408,13 @@ class AsyncExecutor:
         )
 
         throughput = result_data["request_meta_data"].pop("throughput", None)
-        # Use expected_scheduled_time from request context if concurrent execution, otherwise use instance variable
-        expected_scheduled_time = request_context.get('expected_scheduled_time') if request_context else self.expected_scheduled_time
+        # Use expected_scheduled_time from execution context if concurrent execution, otherwise use instance variable
+        expected_scheduled_time = execution_context.get('expected_scheduled_time') if execution_context else self.expected_scheduled_time
         latency = (result_data["request_end"] - (total_start + expected_scheduled_time)
                    if result_data["throughput_throttled"] else service_time)
 
-        # Use runner from request context if concurrent execution, otherwise use instance variable
-        runner = request_context.get('runner') if request_context else self.runner
+        # Use runner from execution context if concurrent execution, otherwise use instance variable
+        runner = execution_context.get('runner') if execution_context else self.runner
         runner_completed = getattr(runner, "completed", False)
         runner_percent_completed = getattr(runner, "percent_completed", None)
 
@@ -2431,8 +2431,8 @@ class AsyncExecutor:
             progress = percent_completed
 
         if client_state:
-            # Use sample_type from request context if concurrent execution, otherwise use instance variable
-            sample_type = request_context.get('sample_type') if request_context else self.sample_type
+            # Use sample_type from execution context if concurrent execution, otherwise use instance variable
+            sample_type = execution_context.get('sample_type') if execution_context else self.sample_type
             if add_profile_metric_sample:
                 self.profile_sampler.add(
                     self.task, self.client_id, sample_type,
@@ -2548,17 +2548,17 @@ class AsyncExecutor:
                 try:
                     client_state = (self.shared_states or {}).get(self.client_id, True)
 
-                    # Create request context to avoid shared state issues
-                    request_context = {
+                    # Create execution context to avoid shared state issues
+                    execution_context = {
                         'expected_scheduled_time': expected_scheduled_time,
                         'sample_type': sample_type,
                         'runner': runner
                     }
 
                     result_data = await self._execute_request(params, expected_scheduled_time, total_start,
-                                                            client_state, request_context)
+                                                            client_state, execution_context)
                     completed = self._process_results(result_data, total_start, client_state, percent_completed,
-                                                    add_profile_metric_sample, request_context)
+                                                    add_profile_metric_sample, execution_context)
                     return completed
                 except Exception as e:
                     self.logger.exception("Error in concurrent request execution")
