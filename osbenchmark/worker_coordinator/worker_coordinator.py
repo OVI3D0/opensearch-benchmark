@@ -2256,7 +2256,11 @@ class AsyncExecutor:
         self.client_options = self._get_client_options()
         self.base_timeout = int(self.client_options.get("timeout", 10))
 
-        # Variables to keep track of during execution
+        # Concurrent execution settings
+        self.max_concurrent_requests = int(self.cfg.opts("client", "max.concurrent.requests", mandatory=False, default_value=1) if self.cfg else 1)
+        self.logger.info("Client [%s] configured for max %d concurrent requests", self.client_id, self.max_concurrent_requests)
+
+        # Variables to keep track of during execution (legacy - used for backward compatibility)
         self.expected_scheduled_time = 0
         self.sample_type = None
         self.runner = None
@@ -2296,7 +2300,7 @@ class AsyncExecutor:
             return context_manager
 
     async def _execute_request(self, params: dict, expected_scheduled_time: float, total_start: float,
-                               client_state: bool) -> dict:
+                               client_state: bool, request_context: dict = None) -> dict:
         """Execute a request with timing control and error handling."""
         request_timeout = (params or {}).get("request-timeout", None)
         absolute_expected_schedule_time = total_start + expected_scheduled_time
@@ -2317,9 +2321,11 @@ class AsyncExecutor:
         total_ops, total_ops_unit, request_meta_data = 0, "ops", {}
         async with context_manager as request_context:
             try:
+                # Use runner from request context if concurrent execution, otherwise use instance variable
+                runner = request_context.get('runner') if request_context else self.runner
                 total_ops, total_ops_unit, request_meta_data = await asyncio.wait_for(
                     execute_single(
-                        self.runner, self.opensearch, params, self.on_error,
+                        runner, self.opensearch, params, self.on_error,
                         redline_enabled=self.redline_enabled, client_enabled=client_state
                     ),
                     timeout=self.base_timeout if request_timeout is None else request_timeout
@@ -2378,7 +2384,8 @@ class AsyncExecutor:
         }
 
     def _process_results(self, result_data: dict, total_start: float, client_state: bool,
-                         percent_completed: float, add_profile_metric_sample: bool = False) -> bool:
+                         percent_completed: float, add_profile_metric_sample: bool = False,
+                         request_context: dict = None) -> bool:
         """Process results from a request."""
         # Handle cases where the request was skipped (no-op)
         if result_data["request_meta_data"].get("skipped_request"):
@@ -2401,11 +2408,15 @@ class AsyncExecutor:
         )
 
         throughput = result_data["request_meta_data"].pop("throughput", None)
-        latency = (result_data["request_end"] - (total_start + self.expected_scheduled_time)
+        # Use expected_scheduled_time from request context if concurrent execution, otherwise use instance variable
+        expected_scheduled_time = request_context.get('expected_scheduled_time') if request_context else self.expected_scheduled_time
+        latency = (result_data["request_end"] - (total_start + expected_scheduled_time)
                    if result_data["throughput_throttled"] else service_time)
 
-        runner_completed = getattr(self.runner, "completed", False)
-        runner_percent_completed = getattr(self.runner, "percent_completed", None)
+        # Use runner from request context if concurrent execution, otherwise use instance variable
+        runner = request_context.get('runner') if request_context else self.runner
+        runner_completed = getattr(runner, "completed", False)
+        runner_percent_completed = getattr(runner, "percent_completed", None)
 
         if self.task_completes_parent:
             completed = runner_completed
@@ -2420,9 +2431,11 @@ class AsyncExecutor:
             progress = percent_completed
 
         if client_state:
+            # Use sample_type from request context if concurrent execution, otherwise use instance variable
+            sample_type = request_context.get('sample_type') if request_context else self.sample_type
             if add_profile_metric_sample:
                 self.profile_sampler.add(
-                    self.task, self.client_id, self.sample_type,
+                    self.task, self.client_id, sample_type,
                     result_data["request_meta_data"],
                     result_data["absolute_processing_start"],
                     result_data["request_start"],
@@ -2431,7 +2444,7 @@ class AsyncExecutor:
                     result_data["request_meta_data"].pop("dependent_timing", None))
             else:
                 self.sampler.add(
-                    self.task, self.client_id, self.sample_type,
+                    self.task, self.client_id, sample_type,
                     result_data["request_meta_data"],
                     result_data["absolute_processing_start"],
                     result_data["request_start"],
@@ -2454,7 +2467,8 @@ class AsyncExecutor:
             try:
                 self.error_queue.put_nowait(error_info)
             except queue.Full:
-                self.logger.warning("Error queue full; dropping error from client %s", self.client_id)
+                pass
+                # self.logger.warning("Error queue full; dropping error from client %s", self.client_id)
 
     async def __call__(self, *args, **kwargs):
         self.task_completes_parent = self.task.completes_parent
@@ -2467,7 +2481,15 @@ class AsyncExecutor:
 
         await self._wait_for_rampup(rampup_wait_time)
 
-        self.logger.debug("Entering main loop for client id [%s].", self.client_id)
+        # Choose execution mode based on max_concurrent_requests setting
+        if self.max_concurrent_requests > 1:
+            await self._concurrent_execution_loop(schedule, total_start)
+        else:
+            await self._sequential_execution_loop(schedule, total_start)
+
+    async def _sequential_execution_loop(self, schedule, total_start):
+        """Original sequential execution logic for backward compatibility."""
+        self.logger.debug("Entering sequential execution loop for client id [%s].", self.client_id)
         profile_metrics_sample_count = 0
         try:
             async for expected_scheduled_time, sample_type, percent_completed, runner, params in schedule:
@@ -2499,6 +2521,105 @@ class AsyncExecutor:
                     break
         except BaseException as e:
             self.logger.exception("Could not execute schedule")
+            raise exceptions.BenchmarkError(f"Cannot run task [{self.task}]: {e}") from None
+        finally:
+            if self.task_completes_parent:
+                self.logger.info(
+                    "Task [%s] completes parent. Client id [%s] is finished executing it and signals completion.",
+                    self.task, self.client_id
+                )
+                self.complete.set()
+            await self._cleanup()
+
+    async def _concurrent_execution_loop(self, schedule, total_start):
+        """New concurrent execution logic with semaphore-based throttling."""
+        self.logger.debug("Entering concurrent execution loop for client id [%s] with max %d concurrent requests.",
+                         self.client_id, self.max_concurrent_requests)
+
+        # Semaphore to limit concurrent requests
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        in_flight_tasks = set()
+        profile_metrics_sample_count = 0
+
+        async def execute_with_semaphore(expected_scheduled_time, sample_type, percent_completed, runner, params,
+                                       add_profile_metric_sample):
+            """Execute a single request with semaphore control and error handling."""
+            async with semaphore:
+                try:
+                    client_state = (self.shared_states or {}).get(self.client_id, True)
+
+                    # Create request context to avoid shared state issues
+                    request_context = {
+                        'expected_scheduled_time': expected_scheduled_time,
+                        'sample_type': sample_type,
+                        'runner': runner
+                    }
+
+                    result_data = await self._execute_request(params, expected_scheduled_time, total_start,
+                                                            client_state, request_context)
+                    completed = self._process_results(result_data, total_start, client_state, percent_completed,
+                                                    add_profile_metric_sample, request_context)
+                    return completed
+                except Exception as e:
+                    self.logger.exception("Error in concurrent request execution")
+                    # Don't let individual request failures stop the whole client
+                    return False
+
+        try:
+            async for expected_scheduled_time, sample_type, percent_completed, runner, params in schedule:
+                if self.cancel.is_set():
+                    self.logger.info("User cancelled execution.")
+                    break
+
+                # Clean up completed tasks and check for completion signals
+                done_tasks = {task for task in in_flight_tasks if task.done()}
+                for task in done_tasks:
+                    try:
+                        if await task:  # Check if any task signaled completion
+                            self.logger.info("Task [%s] completed, exiting concurrent loop", self.task)
+                            # Cancel remaining tasks
+                            for remaining_task in in_flight_tasks - done_tasks:
+                                remaining_task.cancel()
+                            return
+                    except Exception as e:
+                        # Log but don't stop for individual task errors
+                        self.logger.warning("Task completion check failed: %s", e)
+
+                in_flight_tasks -= done_tasks
+
+                # Handle profile metrics sampling
+                profile_metrics_sample_size = (params or {}).get("profile-metrics-sample-size", None)
+                add_profile_metric_sample = profile_metrics_sample_size and profile_metrics_sample_count < profile_metrics_sample_size
+                if add_profile_metric_sample:
+                    profile_metrics_sample_count += 1
+                    params["profile-query"] = True
+                elif params:
+                    params["profile-query"] = False
+
+                # Start new request without waiting for completion
+                task = asyncio.create_task(
+                    execute_with_semaphore(expected_scheduled_time, sample_type, percent_completed,
+                                         runner, params, add_profile_metric_sample)
+                )
+                in_flight_tasks.add(task)
+
+            # Wait for all remaining tasks to complete
+            if in_flight_tasks:
+                self.logger.debug("Waiting for %d remaining concurrent requests to complete", len(in_flight_tasks))
+                results = await asyncio.gather(*in_flight_tasks, return_exceptions=True)
+
+                # Check if any remaining task signaled completion
+                for result in results:
+                    if result is True:
+                        self.logger.info("Task [%s] completed during final gather", self.task)
+                        break
+
+        except BaseException as e:
+            self.logger.exception("Could not execute concurrent schedule")
+            # Cancel any remaining tasks
+            for task in in_flight_tasks:
+                if not task.done():
+                    task.cancel()
             raise exceptions.BenchmarkError(f"Cannot run task [{self.task}]: {e}") from None
         finally:
             if self.task_completes_parent:
