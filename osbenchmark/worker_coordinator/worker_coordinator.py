@@ -45,7 +45,7 @@ from enum import Enum
 
 import thespian.actors
 
-from osbenchmark import actor, config, exceptions, metrics, workload, client, paths, PROGRAM_NAME, telemetry
+from osbenchmark import actor, config, exceptions, metrics, workload, client, paths, PROGRAM_NAME, telemetry, profiler
 from osbenchmark.worker_coordinator import runner, scheduler
 from osbenchmark.workload import WorkloadProcessorRegistry, load_workload, load_workload_plugins, ingestion_manager
 from osbenchmark.utils import convert, console, net
@@ -1284,11 +1284,12 @@ class WorkerCoordinator:
             self.metrics_store.close()
 
     def update_samples(self, samples):
-        if len(samples) > 0:
-            self.raw_samples += samples
-            # We need to check all samples, they will be from different clients
-            for s in samples:
-                self.most_recent_sample_per_client[s.client_id] = s
+        with profiler.ProfileContext("update_samples"):
+            if len(samples) > 0:
+                self.raw_samples += samples
+                # We need to check all samples, they will be from different clients
+                for s in samples:
+                    self.most_recent_sample_per_client[s.client_id] = s
 
     def update_profile_samples(self, profile_samples):
         if len(profile_samples) > 0:
@@ -1314,19 +1315,20 @@ class WorkerCoordinator:
                 self.progress_publisher.finish()
 
     def post_process_samples(self):
-        # we do *not* do this here to avoid concurrent updates (actors are single-threaded) but rather to make it clear that we use
-        # only a snapshot and that new data will go to a new sample set.
-        raw_samples = self.raw_samples
-        self.raw_samples = []
-        self.sample_post_processor(raw_samples)
-        profile_samples = self.raw_profile_samples
-        self.raw_profile_samples = []
-        if len(profile_samples) > 0:
-            if self.profile_metrics_post_processor is None:
-                self.profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(self.metrics_store,
-                                                                                    self.workload.meta_data,
-                                                                                    self.test_procedure.meta_data)
-            self.profile_metrics_post_processor(profile_samples)
+        with profiler.ProfileContext("post_process_samples"):
+            # we do *not* do this here to avoid concurrent updates (actors are single-threaded) but rather to make it clear that we use
+            # only a snapshot and that new data will go to a new sample set.
+            raw_samples = self.raw_samples
+            self.raw_samples = []
+            self.sample_post_processor(raw_samples)
+            profile_samples = self.raw_profile_samples
+            self.raw_profile_samples = []
+            if len(profile_samples) > 0:
+                if self.profile_metrics_post_processor is None:
+                    self.profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(self.metrics_store,
+                                                                                        self.workload.meta_data,
+                                                                                        self.test_procedure.meta_data)
+                self.profile_metrics_post_processor(profile_samples)
 
 class SamplePostprocessor():
     """
@@ -1356,124 +1358,125 @@ class DefaultSamplePostprocessor(SamplePostprocessor):
         self.downsample_factor = downsample_factor
 
     def __call__(self, raw_samples):
-        if len(raw_samples) == 0:
-            return
-        total_start = time.perf_counter()
-        start = total_start
-        final_sample_count = 0
-        for idx, sample in enumerate(raw_samples):
-            self.logger.debug(
-                "All sample meta data: [%s],[%s],[%s],[%s],[%s]",
-                self.workload_meta_data,
-                self.test_procedure_meta_data,
-                sample.operation_meta_data,
-                sample.task.meta_data,
-                sample.request_meta_data,
-            )
-
-            # if request_meta_data exists then it will have {"success": true/false} as a parameter.
-            if sample.request_meta_data and len(sample.request_meta_data) > 1:
-                self.logger.debug("Found: %s", sample.request_meta_data)
-
-                recall_metric_names = ["recall@k", "recall@1"]
-
-                for recall_metric_name in recall_metric_names:
-                    if recall_metric_name in sample.request_meta_data:
-                        meta_data = self.merge(
-                            self.workload_meta_data,
-                            self.test_procedure_meta_data,
-                            sample.operation_meta_data,
-                            sample.task.meta_data,
-                            sample.request_meta_data,
-                        )
-
-                        self.metrics_store.put_value_cluster_level(
-                            name=recall_metric_name,
-                            value=sample.request_meta_data[recall_metric_name],
-                            unit="",
-                            task=sample.task.name,
-                            operation=sample.operation_name,
-                            operation_type=sample.operation_type,
-                            sample_type=sample.sample_type,
-                            absolute_time=sample.absolute_time,
-                            relative_time=sample.relative_time,
-                            meta_data=meta_data,
-                        )
-
-            if idx % self.downsample_factor == 0:
-                final_sample_count += 1
-                meta_data = self.merge(
+        with profiler.ProfileContext("sample_postprocessor"):
+            if len(raw_samples) == 0:
+                return
+            total_start = time.perf_counter()
+            start = total_start
+            final_sample_count = 0
+            for idx, sample in enumerate(raw_samples):
+                self.logger.debug(
+                    "All sample meta data: [%s],[%s],[%s],[%s],[%s]",
                     self.workload_meta_data,
                     self.test_procedure_meta_data,
                     sample.operation_meta_data,
                     sample.task.meta_data,
-                    sample.request_meta_data)
+                    sample.request_meta_data,
+                )
 
-                self.metrics_store.put_value_cluster_level(name="latency", value=convert.seconds_to_ms(sample.latency),
-                                                           unit="ms", task=sample.task.name,
-                                                           operation=sample.operation_name, operation_type=sample.operation_type,
-                                                           sample_type=sample.sample_type, absolute_time=sample.absolute_time,
-                                                           relative_time=sample.relative_time, meta_data=meta_data)
+                # if request_meta_data exists then it will have {"success": true/false} as a parameter.
+                if sample.request_meta_data and len(sample.request_meta_data) > 1:
+                    self.logger.debug("Found: %s", sample.request_meta_data)
 
-                self.metrics_store.put_value_cluster_level(name="service_time", value=convert.seconds_to_ms(sample.service_time),
-                                                           unit="ms", task=sample.task.name,
-                                                           operation=sample.operation_name, operation_type=sample.operation_type,
-                                                           sample_type=sample.sample_type, absolute_time=sample.absolute_time,
-                                                           relative_time=sample.relative_time, meta_data=meta_data)
+                    recall_metric_names = ["recall@k", "recall@1"]
 
-                self.metrics_store.put_value_cluster_level(name="client_processing_time",
-                                                           value=convert.seconds_to_ms(sample.client_processing_time),
-                                                           unit="ms", task=sample.task.name,
-                                                           operation=sample.operation_name, operation_type=sample.operation_type,
-                                                           sample_type=sample.sample_type, absolute_time=sample.absolute_time,
-                                                           relative_time=sample.relative_time, meta_data=meta_data)
+                    for recall_metric_name in recall_metric_names:
+                        if recall_metric_name in sample.request_meta_data:
+                            meta_data = self.merge(
+                                self.workload_meta_data,
+                                self.test_procedure_meta_data,
+                                sample.operation_meta_data,
+                                sample.task.meta_data,
+                                sample.request_meta_data,
+                            )
 
-                self.metrics_store.put_value_cluster_level(name="processing_time", value=convert.seconds_to_ms(sample.processing_time),
-                                                           unit="ms", task=sample.task.name,
-                                                           operation=sample.operation_name, operation_type=sample.operation_type,
-                                                           sample_type=sample.sample_type, absolute_time=sample.absolute_time,
-                                                           relative_time=sample.relative_time, meta_data=meta_data)
+                            self.metrics_store.put_value_cluster_level(
+                                name=recall_metric_name,
+                                value=sample.request_meta_data[recall_metric_name],
+                                unit="",
+                                task=sample.task.name,
+                                operation=sample.operation_name,
+                                operation_type=sample.operation_type,
+                                sample_type=sample.sample_type,
+                                absolute_time=sample.absolute_time,
+                                relative_time=sample.relative_time,
+                                meta_data=meta_data,
+                            )
 
-                for timing in sample.dependent_timings:
-                    self.metrics_store.put_value_cluster_level(name="service_time", value=convert.seconds_to_ms(timing.service_time),
-                                                               unit="ms", task=timing.task.name,
-                                                               operation=timing.operation_name, operation_type=timing.operation_type,
-                                                               sample_type=timing.sample_type, absolute_time=timing.absolute_time,
-                                                               relative_time=timing.relative_time, meta_data=meta_data)
+                if idx % self.downsample_factor == 0:
+                    final_sample_count += 1
+                    meta_data = self.merge(
+                        self.workload_meta_data,
+                        self.test_procedure_meta_data,
+                        sample.operation_meta_data,
+                        sample.task.meta_data,
+                        sample.request_meta_data)
 
-        end = time.perf_counter()
-        self.logger.debug("Storing latency and service time took [%f] seconds.", (end - start))
-        start = end
-        aggregates = self.throughput_calculator.calculate(raw_samples)
-        end = time.perf_counter()
-        self.logger.debug("Calculating throughput took [%f] seconds.", (end - start))
-        start = end
-        for task, samples in aggregates.items():
-            meta_data = self.merge(
-                self.workload_meta_data,
-                self.test_procedure_meta_data,
-                task.operation.meta_data,
-                task.meta_data
-            )
-            for absolute_time, relative_time, sample_type, throughput, throughput_unit in samples:
-                self.metrics_store.put_value_cluster_level(name="throughput", value=throughput, unit=throughput_unit, task=task.name,
-                                                           operation=task.operation.name, operation_type=task.operation.type,
-                                                           sample_type=sample_type, absolute_time=absolute_time,
-                                                           relative_time=relative_time, meta_data=meta_data)
-        end = time.perf_counter()
-        self.logger.debug("Storing throughput took [%f] seconds.", (end - start))
-        start = end
-        # this will be a noop for the in-memory metrics store. If we use an ES metrics store however, this will ensure that we already send
-        # the data and also clear the in-memory buffer. This allows users to see data already while running the benchmark. In cases where
-        # it does not matter (i.e. in-memory) we will still defer this step until the end.
-        #
-        # Don't force refresh here in the interest of short processing times. We don't need to query immediately afterwards so there is
-        # no need for frequent refreshes.
-        self.metrics_store.flush(refresh=False)
-        end = time.perf_counter()
-        self.logger.debug("Flushing the metrics store took [%f] seconds.", (end - start))
-        self.logger.debug("Postprocessing [%d] raw samples (downsampled to [%d] samples) took [%f] seconds in total.",
-                          len(raw_samples), final_sample_count, (end - total_start))
+                    self.metrics_store.put_value_cluster_level(name="latency", value=convert.seconds_to_ms(sample.latency),
+                                                               unit="ms", task=sample.task.name,
+                                                               operation=sample.operation_name, operation_type=sample.operation_type,
+                                                               sample_type=sample.sample_type, absolute_time=sample.absolute_time,
+                                                               relative_time=sample.relative_time, meta_data=meta_data)
+
+                    self.metrics_store.put_value_cluster_level(name="service_time", value=convert.seconds_to_ms(sample.service_time),
+                                                               unit="ms", task=sample.task.name,
+                                                               operation=sample.operation_name, operation_type=sample.operation_type,
+                                                               sample_type=sample.sample_type, absolute_time=sample.absolute_time,
+                                                               relative_time=sample.relative_time, meta_data=meta_data)
+
+                    self.metrics_store.put_value_cluster_level(name="client_processing_time",
+                                                               value=convert.seconds_to_ms(sample.client_processing_time),
+                                                               unit="ms", task=sample.task.name,
+                                                               operation=sample.operation_name, operation_type=sample.operation_type,
+                                                               sample_type=sample.sample_type, absolute_time=sample.absolute_time,
+                                                               relative_time=sample.relative_time, meta_data=meta_data)
+
+                    self.metrics_store.put_value_cluster_level(name="processing_time", value=convert.seconds_to_ms(sample.processing_time),
+                                                               unit="ms", task=sample.task.name,
+                                                               operation=sample.operation_name, operation_type=sample.operation_type,
+                                                               sample_type=sample.sample_type, absolute_time=sample.absolute_time,
+                                                               relative_time=sample.relative_time, meta_data=meta_data)
+
+                    for timing in sample.dependent_timings:
+                        self.metrics_store.put_value_cluster_level(name="service_time", value=convert.seconds_to_ms(timing.service_time),
+                                                                   unit="ms", task=timing.task.name,
+                                                                   operation=timing.operation_name, operation_type=timing.operation_type,
+                                                                   sample_type=timing.sample_type, absolute_time=timing.absolute_time,
+                                                                   relative_time=timing.relative_time, meta_data=meta_data)
+
+            end = time.perf_counter()
+            self.logger.debug("Storing latency and service time took [%f] seconds.", (end - start))
+            start = end
+            aggregates = self.throughput_calculator.calculate(raw_samples)
+            end = time.perf_counter()
+            self.logger.debug("Calculating throughput took [%f] seconds.", (end - start))
+            start = end
+            for task, samples in aggregates.items():
+                meta_data = self.merge(
+                    self.workload_meta_data,
+                    self.test_procedure_meta_data,
+                    task.operation.meta_data,
+                    task.meta_data
+                )
+                for absolute_time, relative_time, sample_type, throughput, throughput_unit in samples:
+                    self.metrics_store.put_value_cluster_level(name="throughput", value=throughput, unit=throughput_unit, task=task.name,
+                                                               operation=task.operation.name, operation_type=task.operation.type,
+                                                               sample_type=sample_type, absolute_time=absolute_time,
+                                                               relative_time=relative_time, meta_data=meta_data)
+            end = time.perf_counter()
+            self.logger.debug("Storing throughput took [%f] seconds.", (end - start))
+            start = end
+            # this will be a noop for the in-memory metrics store. If we use an ES metrics store however, this will ensure that we already send
+            # the data and also clear the in-memory buffer. This allows users to see data already while running the benchmark. In cases where
+            # it does not matter (i.e. in-memory) we will still defer this step until the end.
+            #
+            # Don't force refresh here in the interest of short processing times. We don't need to query immediately afterwards so there is
+            # no need for frequent refreshes.
+            self.metrics_store.flush(refresh=False)
+            end = time.perf_counter()
+            self.logger.debug("Flushing the metrics store took [%f] seconds.", (end - start))
+            self.logger.debug("Postprocessing [%d] raw samples (downsampled to [%d] samples) took [%f] seconds in total.",
+                              len(raw_samples), final_sample_count, (end - total_start))
 
 
 class ProfileMetricsSamplePostprocessor(SamplePostprocessor):
@@ -1807,12 +1810,13 @@ class Worker(actor.BenchmarkActor):
         return current
 
     def send_samples(self):
-        if self.sampler:
-            samples = self.sampler.samples
-            if len(samples) > 0:
-                self.send(self.master, UpdateSamples(self.worker_id, samples, self.profile_sampler.samples))
-            return samples
-        return None
+        with profiler.ProfileContext("worker_send_samples"):
+            if self.sampler:
+                samples = self.sampler.samples
+                if len(samples) > 0:
+                    self.send(self.master, UpdateSamples(self.worker_id, samples, self.profile_sampler.samples))
+                return samples
+            return None
 
 
 class Sampler:
@@ -2008,39 +2012,39 @@ class ThroughputCalculator:
         :param bucket_interval_secs: The bucket interval for aggregations.
         :return: A global view of throughput samples.
         """
+        with profiler.ProfileContext("throughput_calculation"):
+            samples_per_task = {}
+            # first we group all samples by task (operation).
+            for sample in samples:
+                k = sample.task
+                if k not in samples_per_task:
+                    samples_per_task[k] = []
+                samples_per_task[k].append(sample)
 
-        samples_per_task = {}
-        # first we group all samples by task (operation).
-        for sample in samples:
-            k = sample.task
-            if k not in samples_per_task:
-                samples_per_task[k] = []
-            samples_per_task[k].append(sample)
+            global_throughput = {}
+            # with open("raw_samples_new.csv", "a") as sample_log:
+            # print("client_id,absolute_time,relative_time,operation,sample_type,total_ops,time_period", file=sample_log)
+            for k, v in samples_per_task.items():
+                task = k
+                if task not in global_throughput:
+                    global_throughput[task] = []
+                # sort all samples by time
+                if task in self.task_stats:
+                    samples = itertools.chain(v, self.task_stats[task].unprocessed)
+                else:
+                    samples = v
+                current_samples = sorted(samples, key=lambda s: s.absolute_time)
 
-        global_throughput = {}
-        # with open("raw_samples_new.csv", "a") as sample_log:
-        # print("client_id,absolute_time,relative_time,operation,sample_type,total_ops,time_period", file=sample_log)
-        for k, v in samples_per_task.items():
-            task = k
-            if task not in global_throughput:
-                global_throughput[task] = []
-            # sort all samples by time
-            if task in self.task_stats:
-                samples = itertools.chain(v, self.task_stats[task].unprocessed)
-            else:
-                samples = v
-            current_samples = sorted(samples, key=lambda s: s.absolute_time)
+                # Calculate throughput based on service time if the runner does not provide one, otherwise use it as is and
+                # only transform the values into the expected structure.
+                first_sample = current_samples[0]
+                if first_sample.throughput is None:
+                    task_throughput = self.calculate_task_throughput(task, current_samples, bucket_interval_secs)
+                else:
+                    task_throughput = self.map_task_throughput(current_samples)
+                global_throughput[task].extend(task_throughput)
 
-            # Calculate throughput based on service time if the runner does not provide one, otherwise use it as is and
-            # only transform the values into the expected structure.
-            first_sample = current_samples[0]
-            if first_sample.throughput is None:
-                task_throughput = self.calculate_task_throughput(task, current_samples, bucket_interval_secs)
-            else:
-                task_throughput = self.map_task_throughput(current_samples)
-            global_throughput[task].extend(task_throughput)
-
-        return global_throughput
+            return global_throughput
 
     def calculate_task_throughput(self, task, current_samples, bucket_interval_secs):
         task_throughput = []

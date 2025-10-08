@@ -32,7 +32,7 @@ import thespian.actors
 
 from osbenchmark import actor, config, doc_link, \
     worker_coordinator, exceptions, builder, metrics, \
-        publisher, workload, version, PROGRAM_NAME
+        publisher, workload, version, PROGRAM_NAME, profiler
 from osbenchmark.utils import console, opts, versions
 
 
@@ -358,6 +358,14 @@ def list_pipelines():
 
 def run(cfg):
     logger = logging.getLogger(__name__)
+
+    # Enable profiling if configured
+    profiling_enabled = cfg.opts("system", "profiling.enabled", mandatory=False, default_value=False) or \
+                       os.environ.get("OSB_ENABLE_PROFILING", "").lower() == "true"
+    if profiling_enabled:
+        profiler.enable()
+        logger.info("Profiling enabled")
+
     # pipeline is no more mandatory, will default to benchmark-only
     name = cfg.opts("test_run", "pipeline", mandatory=False)
     test_run_id = cfg.opts("system", "test_run.id")
@@ -398,3 +406,7 @@ def run(cfg):
     except BaseException:
         tb = sys.exc_info()[2]
         raise exceptions.BenchmarkError("This test_run ended with a fatal crash.").with_traceback(tb)
+    finally:
+        # Write profiling results if enabled
+        if profiling_enabled:
+            profiler.write_results()
