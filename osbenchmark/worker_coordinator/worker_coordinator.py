@@ -921,6 +921,15 @@ class WorkerCoordinator:
         self.logger = logging.getLogger(__name__)
         self.target = target
         self.config = config
+
+        # Enable profiling in coordinator process if configured
+        import os
+        profiling_enabled = self.config.opts("system", "profiling.enabled", mandatory=False, default_value=False) or \
+                           os.environ.get("OSB_ENABLE_PROFILING", "").lower() == "true"
+        if profiling_enabled:
+            profiler.enable()
+            self.logger.info("WorkerCoordinator: Profiling enabled")
+
         ingestion_manager.IngestionManager.config = config
         self.os_client_factory = os_client_factory_class
         self.workload = None
@@ -1655,6 +1664,15 @@ class Worker(actor.BenchmarkActor):
         self.master = sender
         self.worker_id = msg.worker_id
         self.config = load_local_config(msg.config)
+
+        # Enable profiling in worker process if configured
+        import os
+        profiling_enabled = self.config.opts("system", "profiling.enabled", mandatory=False, default_value=False) or \
+                           os.environ.get("OSB_ENABLE_PROFILING", "").lower() == "true"
+        if profiling_enabled:
+            profiler.enable()
+            self.logger.info("Worker[%d]: Profiling enabled", msg.worker_id)
+
         self.on_error = self.config.opts("worker_coordinator", "on.error")
         self.sample_queue_size = int(self.config.opts("reporting", "sample.queue.size", mandatory=False, default_value=1 << 20))
         self.workload = msg.workload
