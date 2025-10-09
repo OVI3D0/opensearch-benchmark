@@ -1300,6 +1300,7 @@ class WorkerCoordinator:
             self.logger.info("Coordinator profiling results written to profiling_results_coordinator.json")
 
     def update_samples(self, samples):
+        self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
         with profiler.ProfileContext("update_samples"):
             if len(samples) > 0:
                 self.raw_samples += samples
@@ -1331,6 +1332,7 @@ class WorkerCoordinator:
                 self.progress_publisher.finish()
 
     def post_process_samples(self):
+        self.logger.info(f"POST_PROCESS_SAMPLES CALLED: len(raw_samples)={len(self.raw_samples)}, profiler.enabled={profiler._profiler.enabled}")
         with profiler.ProfileContext("post_process_samples"):
             # we do *not* do this here to avoid concurrent updates (actors are single-threaded) but rather to make it clear that we use
             # only a snapshot and that new data will go to a new sample set.
