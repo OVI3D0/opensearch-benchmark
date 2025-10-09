@@ -407,6 +407,6 @@ def run(cfg):
         tb = sys.exc_info()[2]
         raise exceptions.BenchmarkError("This test_run ended with a fatal crash.").with_traceback(tb)
     finally:
-        # Write profiling results if enabled
-        if profiling_enabled:
-            profiler.write_results()
+        # Write profiling results if enabled (only if there's data in main process)
+        if profiling_enabled and len(profiler.get_stats()) > 0:
+            profiler.write_results("profiling_results_main.json")

@@ -1292,6 +1292,11 @@ class WorkerCoordinator:
         if self.metrics_store and self.metrics_store.opened:
             self.metrics_store.close()
 
+        # Write profiling results from coordinator process
+        if profiler._profiler.enabled:
+            profiler.write_results("profiling_results_coordinator.json")
+            self.logger.info("Coordinator profiling results written to profiling_results_coordinator.json")
+
     def update_samples(self, samples):
         with profiler.ProfileContext("update_samples"):
             if len(samples) > 0:
@@ -1796,6 +1801,13 @@ class Worker(actor.BenchmarkActor):
             if self.executor_future is not None:
                 self.executor_future.result()
             self.send_samples()
+
+            # Write profiling results when worker finishes (at final join point)
+            if profiler._profiler.enabled and self.current_task_index >= len(self.client_allocations) - 1:
+                import os
+                profiler.write_results(f"profiling_results_worker_{self.worker_id}.json")
+                self.logger.info("Worker[%d]: Profiling results written", self.worker_id)
+
             self.cancel.clear()
             self.complete.clear()
             self.executor_future = None
