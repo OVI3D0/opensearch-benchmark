@@ -622,6 +622,8 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
 
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Main worker_coordinator received ActorExitRequest and will terminate all load generators.")
+        if self.coordinator is not None:
+            self.coordinator.close()
         self.status = "exiting"
 
     def receiveMsg_ChildActorExited(self, msg, sender):
@@ -964,6 +966,7 @@ class WorkerCoordinator:
         self.complete_current_task_sent = False
 
         self.telemetry = None
+        self._closed = False
 
     def create_os_clients(self):
         all_hosts = self.config.opts("client", "hosts").all_hosts
@@ -1290,6 +1293,9 @@ class WorkerCoordinator:
         return self.current_step == self.number_of_steps
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         self.progress_publisher.finish()
         if self.metrics_store and self.metrics_store.opened:
             self.metrics_store.close()
