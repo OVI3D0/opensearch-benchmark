@@ -924,11 +924,13 @@ class WorkerCoordinator:
 
         # Enable profiling in coordinator process if configured
         import os
-        profiling_enabled = self.config.opts("system", "profiling.enabled", mandatory=False, default_value=False) or \
-                           os.environ.get("OSB_ENABLE_PROFILING", "").lower() == "true"
+        config_profiling = self.config.opts("system", "profiling.enabled", mandatory=False, default_value=False)
+        env_profiling = os.environ.get("OSB_ENABLE_PROFILING", "").lower() == "true"
+        profiling_enabled = config_profiling or env_profiling
+        self.logger.info(f"WorkerCoordinator: config_profiling={config_profiling}, env_profiling={env_profiling}, profiling_enabled={profiling_enabled}")
         if profiling_enabled:
             profiler.enable()
-            self.logger.info("WorkerCoordinator: Profiling enabled")
+            self.logger.info(f"WorkerCoordinator: Profiling enabled (profiler.enabled={profiler._profiler.enabled})")
 
         ingestion_manager.IngestionManager.config = config
         self.os_client_factory = os_client_factory_class
@@ -1672,11 +1674,13 @@ class Worker(actor.BenchmarkActor):
 
         # Enable profiling in worker process if configured
         import os
-        profiling_enabled = self.config.opts("system", "profiling.enabled", mandatory=False, default_value=False) or \
-                           os.environ.get("OSB_ENABLE_PROFILING", "").lower() == "true"
+        config_profiling = self.config.opts("system", "profiling.enabled", mandatory=False, default_value=False)
+        env_profiling = os.environ.get("OSB_ENABLE_PROFILING", "").lower() == "true"
+        profiling_enabled = config_profiling or env_profiling
+        self.logger.info(f"Worker[{msg.worker_id}]: config_profiling={config_profiling}, env_profiling={env_profiling}, profiling_enabled={profiling_enabled}")
         if profiling_enabled:
             profiler.enable()
-            self.logger.info("Worker[%d]: Profiling enabled", msg.worker_id)
+            self.logger.info(f"Worker[{msg.worker_id}]: Profiling enabled (profiler.enabled={profiler._profiler.enabled})")
 
         self.on_error = self.config.opts("worker_coordinator", "on.error")
         self.sample_queue_size = int(self.config.opts("reporting", "sample.queue.size", mandatory=False, default_value=1 << 20))
@@ -1780,6 +1784,12 @@ class Worker(actor.BenchmarkActor):
         if self.executor_future is not None and self.executor_future.running():
             self.cancel.set()
         self.pool.shutdown()
+
+        # Write profiling results when worker exits
+        if profiler._profiler.enabled:
+            profiler.write_results(f"profiling_results_worker_{self.worker_id}.json")
+            self.logger.info("Worker[%d]: Profiling results written", self.worker_id)
+
         self.logger.info("Worker[%s] is exiting due to ActorExitRequest.", str(self.worker_id))
 
     def receiveMsg_BenchmarkFailure(self, msg, sender):
@@ -1801,12 +1811,6 @@ class Worker(actor.BenchmarkActor):
             if self.executor_future is not None:
                 self.executor_future.result()
             self.send_samples()
-
-            # Write profiling results when worker finishes (at final join point)
-            if profiler._profiler.enabled and self.current_task_index >= len(self.client_allocations) - 1:
-                import os
-                profiler.write_results(f"profiling_results_worker_{self.worker_id}.json")
-                self.logger.info("Worker[%d]: Profiling results written", self.worker_id)
 
             self.cancel.clear()
             self.complete.clear()
