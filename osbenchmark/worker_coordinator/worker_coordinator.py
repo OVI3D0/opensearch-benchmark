@@ -1304,12 +1304,16 @@ class WorkerCoordinator:
 
     def update_samples(self, samples):
         self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
-        with profiler.ProfileContext("update_samples"):
-            if len(samples) > 0:
-                self.raw_samples += samples
-                # We need to check all samples, they will be from different clients
-                for s in samples:
-                    self.most_recent_sample_per_client[s.client_id] = s
+        try:
+            with profiler.ProfileContext("update_samples"):
+                if len(samples) > 0:
+                    self.raw_samples += samples
+                    # We need to check all samples, they will be from different clients
+                    for s in samples:
+                        self.most_recent_sample_per_client[s.client_id] = s
+            self.logger.info(f"UPDATE_SAMPLES completed, current stats count: {len(profiler.get_stats())}")
+        except Exception as e:
+            self.logger.error(f"UPDATE_SAMPLES ProfileContext error: {e}", exc_info=True)
 
     def update_profile_samples(self, profile_samples):
         if len(profile_samples) > 0:
