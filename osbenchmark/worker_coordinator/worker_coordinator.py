@@ -1294,8 +1294,11 @@ class WorkerCoordinator:
         if self.metrics_store and self.metrics_store.opened:
             self.metrics_store.close()
 
-        # Write profiling results from coordinator process
-        if profiler._profiler.enabled:
+        # Write profiling results from coordinator process (only once)
+        if profiler._profiler.enabled and not hasattr(self, '_profiling_written'):
+            self._profiling_written = True
+            stats = profiler.get_stats()
+            self.logger.info(f"Coordinator profiling: {len(stats)} operations collected before write")
             profiler.write_results("profiling_results_coordinator.json")
             self.logger.info("Coordinator profiling results written to profiling_results_coordinator.json")
 
@@ -1787,8 +1790,11 @@ class Worker(actor.BenchmarkActor):
             self.cancel.set()
         self.pool.shutdown()
 
-        # Write profiling results when worker exits
-        if profiler._profiler.enabled:
+        # Write profiling results when worker exits (only once)
+        if profiler._profiler.enabled and not hasattr(self, '_profiling_written'):
+            self._profiling_written = True
+            stats = profiler.get_stats()
+            self.logger.info(f"Worker[{self.worker_id}] profiling: {len(stats)} operations collected before write")
             profiler.write_results(f"profiling_results_worker_{self.worker_id}.json")
             self.logger.info("Worker[%d]: Profiling results written", self.worker_id)
 
