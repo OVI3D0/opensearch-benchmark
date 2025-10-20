@@ -280,7 +280,7 @@ class StartFeedbackActor:
 
 # pylint: disable=too-many-public-methods
 class FeedbackActor(actor.BenchmarkActor):
-    POST_SCALEDOWN_SECONDS = 30
+    POST_SCALEDOWN_SECONDS = 10
     WAKEUP_INTERVAL = 1
 
     def __init__(self) -> None:
@@ -1308,7 +1308,7 @@ class WorkerCoordinator:
             profiler.write_results("profiling_results_coordinator.json")
             self.logger.info("Coordinator profiling results written to profiling_results_coordinator.json")
 
-    def update_samples(self, samples):
+    def update_samples(self, samples): # WHERE WE APPEND SAMPLES
         self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
         try:
             with profiler.ProfileContext("update_samples"):
@@ -1861,7 +1861,7 @@ class Worker(actor.BenchmarkActor):
         self.logger.debug("Worker[%d] is at task index [%d].", self.worker_id, self.current_task_index)
         return current
 
-    def send_samples(self):
+    def send_samples(self): # THIS IS WHERE THE WORKER SENDS SAMPLES
         with profiler.ProfileContext("worker_send_samples"):
             if self.sampler:
                 samples = self.sampler.samples
