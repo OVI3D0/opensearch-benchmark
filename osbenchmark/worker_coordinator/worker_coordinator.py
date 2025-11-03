@@ -46,7 +46,7 @@ from enum import Enum
 import thespian.actors
 
 from osbenchmark import actor, config, exceptions, metrics, workload, client, paths, PROGRAM_NAME, telemetry, profiler
-from osbenchmark.worker_coordinator import runner, scheduler
+from osbenchmark.worker_coordinator import runner, scheduler, metrics_processing
 from osbenchmark.workload import WorkloadProcessorRegistry, load_workload, load_workload_plugins, ingestion_manager
 from osbenchmark.utils import convert, console, net
 from osbenchmark.worker_coordinator.errors import parse_error
@@ -132,12 +132,13 @@ class StartWorker:
     Starts a worker.
     """
 
-    def __init__(self, worker_id, config, workload, client_allocations, feedback_actor=None, error_queue=None, queue_lock=None, shared_states=None):
+    def __init__(self, worker_id, config, workload, client_allocations, feedback_actor=None, error_queue=None, queue_lock=None, shared_states=None, metrics_actor=None):
         """
         :param worker_id: Unique (numeric) id of the worker.
         :param config: OSB internal configuration object.
         :param workload: The workload to use.
         :param client_allocations: A structure describing which clients need to run which tasks.
+        :param metrics_actor: Address of the MetricsProcessor actor to send samples to.
         """
         self.worker_id = worker_id
         self.config = config
@@ -147,6 +148,7 @@ class StartWorker:
         self.error_queue = error_queue
         self.queue_lock = queue_lock
         self.shared_states = shared_states
+        self.metrics_actor = metrics_actor
 
 
 class Drive:
@@ -206,6 +208,18 @@ class TaskFinished:
     def __init__(self, metrics, next_task_scheduled_in):
         self.metrics = metrics
         self.next_task_scheduled_in = next_task_scheduled_in
+
+
+class StartMetricsProcessor:
+    """
+    Initializes the MetricsProcessor actor with necessary configuration.
+    """
+    def __init__(self, metrics_store, downsample_factor, workload_meta_data, test_procedure_meta_data):
+        self.metrics_store = metrics_store
+        self.downsample_factor = downsample_factor
+        self.workload_meta_data = workload_meta_data
+        self.test_procedure_meta_data = test_procedure_meta_data
+
 
 def load_redline_config():
     config = configparser.ConfigParser()
@@ -595,9 +609,10 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.start_sender = None
         self.coordinator = None
         self.status = "init"
-        self.post_process_timer = 0
+        # self.post_process_timer = 0  # No longer needed - MetricsProcessor handles this
         self.cluster_details = None
         self.feedback_actor = None
+        self.metrics_actor = None  # Will hold the MetricsProcessor actor address
         self.worker_shared_states = {}
 
     def receiveMsg_PoisonMessage(self, poisonmsg, sender):
@@ -615,15 +630,23 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.coordinator.close()
         # shut down FeedbackActor if it's active
         # we do this manually in the workercoordinator since it's fully responsible for the feedback actor
-        if hasattr(self, "feedback_actor"):
+        if hasattr(self, "feedback_actor") and self.feedback_actor:
             self.logger.info("Shutting down FeedbackActor due to benchmark cancellation.")
             self.send(self.feedback_actor, thespian.actors.ActorExitRequest())
+        # shut down MetricsProcessor actor
+        if hasattr(self, "metrics_actor") and self.metrics_actor:
+            self.logger.info("Shutting down MetricsProcessor actor due to benchmark cancellation.")
+            self.send(self.metrics_actor, thespian.actors.ActorExitRequest())
         self.send(self.start_sender, msg)
 
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Main worker_coordinator received ActorExitRequest and will terminate all load generators.")
         if self.coordinator is not None:
             self.coordinator.close()
+        # shut down MetricsProcessor actor
+        if hasattr(self, "metrics_actor") and self.metrics_actor:
+            self.logger.info("Shutting down MetricsProcessor actor.")
+            self.send(self.metrics_actor, thespian.actors.ActorExitRequest())
         self.status = "exiting"
 
     def receiveMsg_ChildActorExited(self, msg, sender):
@@ -647,6 +670,10 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.coordinator = WorkerCoordinator(self, msg.config)
         self.coordinator.prepare_benchmark(msg.workload)
 
+        # Create MetricsProcessor actor
+        self.logger.info("Creating MetricsProcessor actor")
+        self.metrics_actor = self.createActor(metrics_processing.MetricsProcessor)
+
     @actor.no_retry("worker_coordinator")  # pylint: disable=no-value-for-parameter
     def receiveMsg_StartBenchmark(self, msg, sender):
         self.start_sender = sender
@@ -664,18 +691,15 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
 
     @actor.no_retry("worker_coordinator")  # pylint: disable=no-value-for-parameter
     def receiveMsg_UpdateSamples(self, msg, sender):
-        self.coordinator.update_samples(msg.samples)
-        self.coordinator.update_profile_samples(msg.profile_samples)
+        # Samples now sent directly to MetricsProcessor actor
+        pass
 
     @actor.no_retry("worker_coordinator")  # pylint: disable=no-value-for-parameter
     def receiveMsg_WakeupMessage(self, msg, sender):
         if msg.payload == WorkerCoordinatorActor.RESET_RELATIVE_TIME_MARKER:
             self.coordinator.reset_relative_time()
         elif not self.coordinator.finished():
-            self.post_process_timer += WorkerCoordinatorActor.WAKEUP_INTERVAL_SECONDS
-            if self.post_process_timer >= WorkerCoordinatorActor.POST_PROCESS_INTERVAL_SECONDS:
-                self.post_process_timer = 0
-                self.coordinator.post_process_samples()
+            # Post-processing now handled by MetricsProcessor actor
             self.coordinator.update_progress_message()
             self.wakeupAfter(datetime.timedelta(seconds=WorkerCoordinatorActor.WAKEUP_INTERVAL_SECONDS))
 
@@ -683,7 +707,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         return self.createActor(Worker, targetActorRequirements=self._requirements(host))
 
     def start_worker(self, worker_coordinator, worker_id, cfg, workload, allocations, error_queue=None, queue_lock=None, shared_states=None):
-        self.send(worker_coordinator, StartWorker(worker_id, cfg, workload, allocations, self.feedback_actor, error_queue, queue_lock, shared_states))
+        self.send(worker_coordinator, StartWorker(worker_id, cfg, workload, allocations, self.feedback_actor, error_queue, queue_lock, shared_states, self.metrics_actor))
 
     def start_feedbackActor(self, shared_states):
         self.send(
@@ -952,11 +976,12 @@ class WorkerCoordinator:
         self.progress_counter = 0
         self.quiet = False
         self.allocations = None
-        self.raw_samples = []
-        self.raw_profile_samples = []
-        self.most_recent_sample_per_client = {}
-        self.sample_post_processor = None
-        self.profile_metrics_post_processor = None
+        # Metrics processing now handled by MetricsProcessor actor
+        # self.raw_samples = []
+        # self.raw_profile_samples = []
+        self.most_recent_sample_per_client = {}  # Still needed for progress tracking
+        # self.sample_post_processor = None
+        # self.profile_metrics_post_processor = None
 
         self.number_of_steps = 0
         self.currently_completed = 0
@@ -1034,10 +1059,11 @@ class WorkerCoordinator:
                                                    test_procedure=self.test_procedure.name,
                                                    read_only=False)
 
-        self.sample_post_processor = DefaultSamplePostprocessor(self.metrics_store,
-                                                         downsample_factor,
-                                                         self.workload.meta_data,
-                                                         self.test_procedure.meta_data)
+        # Sample post-processing now handled by MetricsProcessor actor
+        # self.sample_post_processor = DefaultSamplePostprocessor(self.metrics_store,
+        #                                                  downsample_factor,
+        #                                                  self.workload.meta_data,
+        #                                                  self.test_procedure.meta_data)
 
         os_clients = self.create_os_clients()
 
@@ -1084,6 +1110,19 @@ class WorkerCoordinator:
         self.logger.info("OSB is about to start.")
         # ensure relative time starts when the benchmark starts.
         self.reset_relative_time()
+
+        # Initialize MetricsProcessor actor
+        downsample_factor = int(self.config.opts(
+            "reporting", "metrics.request.downsample.factor",
+            mandatory=False, default_value=1))
+        self.logger.info("Initializing MetricsProcessor actor with downsample_factor=%d", downsample_factor)
+        self.target.send(self.target.metrics_actor, StartMetricsProcessor(
+            self.metrics_store,
+            downsample_factor,
+            self.workload.meta_data,
+            self.test_procedure.meta_data
+        ))
+
         self.logger.info("Attaching cluster-level telemetry devices.")
         self.telemetry.on_benchmark_start()
         self.logger.info("Cluster-level telemetry devices are now attached.")
@@ -1308,18 +1347,19 @@ class WorkerCoordinator:
             profiler.write_results("profiling_results_coordinator.json")
             self.logger.info("Coordinator profiling results written to profiling_results_coordinator.json")
 
-    def update_samples(self, samples): # WHERE WE APPEND SAMPLES
-        self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
-        try:
-            with profiler.ProfileContext("update_samples"):
-                if len(samples) > 0:
-                    self.raw_samples += samples
-                    # We need to check all samples, they will be from different clients
-                    for s in samples:
-                        self.most_recent_sample_per_client[s.client_id] = s
-            self.logger.info(f"UPDATE_SAMPLES completed, current stats count: {len(profiler.get_stats())}")
-        except Exception as e:
-            self.logger.error(f"UPDATE_SAMPLES ProfileContext error: {e}", exc_info=True)
+    def update_samples(self, samples):
+        pass
+        # self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
+        # try:
+        #     with profiler.ProfileContext("update_samples"):
+        #         if len(samples) > 0:
+        #             self.raw_samples += samples
+        #             # We need to check all samples, they will be from different clients
+        #             for s in samples:
+        #                 self.most_recent_sample_per_client[s.client_id] = s
+        #     self.logger.info(f"UPDATE_SAMPLES completed, current stats count: {len(profiler.get_stats())}")
+        # except Exception as e:
+        #     self.logger.error(f"UPDATE_SAMPLES ProfileContext error: {e}", exc_info=True)
 
     def update_profile_samples(self, profile_samples):
         if len(profile_samples) > 0:
@@ -1345,21 +1385,22 @@ class WorkerCoordinator:
                 self.progress_publisher.finish()
 
     def post_process_samples(self):
-        self.logger.info(f"POST_PROCESS_SAMPLES CALLED: len(raw_samples)={len(self.raw_samples)}, profiler.enabled={profiler._profiler.enabled}")
-        with profiler.ProfileContext("post_process_samples"):
-            # we do *not* do this here to avoid concurrent updates (actors are single-threaded) but rather to make it clear that we use
-            # only a snapshot and that new data will go to a new sample set.
-            raw_samples = self.raw_samples
-            self.raw_samples = []
-            self.sample_post_processor(raw_samples)
-            profile_samples = self.raw_profile_samples
-            self.raw_profile_samples = []
-            if len(profile_samples) > 0:
-                if self.profile_metrics_post_processor is None:
-                    self.profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(self.metrics_store,
-                                                                                        self.workload.meta_data,
-                                                                                        self.test_procedure.meta_data)
-                self.profile_metrics_post_processor(profile_samples)
+        pass
+        # self.logger.info(f"POST_PROCESS_SAMPLES CALLED: len(raw_samples)={len(self.raw_samples)}, profiler.enabled={profiler._profiler.enabled}")
+        # with profiler.ProfileContext("post_process_samples"):
+        #     # we do *not* do this here to avoid concurrent updates (actors are single-threaded) but rather to make it clear that we use
+        #     # only a snapshot and that new data will go to a new sample set.
+        #     raw_samples = self.raw_samples
+        #     self.raw_samples = []
+        #     self.sample_post_processor(raw_samples)
+        #     profile_samples = self.raw_profile_samples
+        #     self.raw_profile_samples = []
+        #     if len(profile_samples) > 0:
+        #         if self.profile_metrics_post_processor is None:
+        #             self.profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(self.metrics_store,
+        #                                                                                 self.workload.meta_data,
+        #                                                                                 self.test_procedure.meta_data)
+        #         self.profile_metrics_post_processor(profile_samples)
 
 class SamplePostprocessor():
     """
@@ -1708,6 +1749,7 @@ class Worker(actor.BenchmarkActor):
         self.shared_states = msg.shared_states
         self.error_queue = msg.error_queue
         self.queue_lock = msg.queue_lock
+        self.metrics_actor = msg.metrics_actor  # MetricsProcessor actor address
         # we need to wake up more often in test mode
         if self.config.opts("workload", "test.mode.enabled"):
             self.wakeup_interval = 0.5
@@ -1866,7 +1908,8 @@ class Worker(actor.BenchmarkActor):
             if self.sampler:
                 samples = self.sampler.samples
                 if len(samples) > 0:
-                    self.send(self.master, UpdateSamples(self.worker_id, samples, self.profile_sampler.samples))
+                    # Send samples to MetricsProcessor actor instead of coordinator
+                    self.send(self.metrics_actor, UpdateSamples(self.worker_id, samples, self.profile_sampler.samples))
                 return samples
             return None
 

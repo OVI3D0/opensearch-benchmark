@@ -39,8 +39,23 @@ class MetricsProcessor(actor.BenchmarkActor):
         self.logger = logging.getLogger(__name__)
 
     def receiveMsg_StartMetricsProcessor(self, msg, sender) -> None:
+        self.logger.info("MetricsProcessor starting with downsample_factor=%d", msg.downsample_factor)
         self.raw_samples = []
+        self.raw_profile_samples = []
+        self.most_recent_sample_per_client = {}
+        self.metrics_store = msg.metrics_store
+        self.workload_meta_data = msg.workload_meta_data
+        self.test_procedure_meta_data = msg.test_procedure_meta_data
+
+        # Create the sample post-processor
+        self.sample_post_processor = DefaultSamplePostprocessor(
+            msg.metrics_store,
+            msg.downsample_factor,
+            msg.workload_meta_data,
+            msg.test_procedure_meta_data
+        )
         self.profile_metrics_post_processor = None
+
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
     def receiveMsg_WakeupMessage(self, msg, sender) -> None:
@@ -63,6 +78,19 @@ class MetricsProcessor(actor.BenchmarkActor):
 
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Metrics Processor received ActorExitRequest. Shutting down...")
+    
+    def update_samples(self, samples):
+        self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
+        try:
+            with profiler.ProfileContext("update_samples"):
+                if len(samples) > 0:
+                    self.raw_samples += samples
+                    # We need to check all samples, they will be from different clients
+                    for s in samples:
+                        self.most_recent_sample_per_client[s.client_id] = s
+            self.logger.info(f"UPDATE_SAMPLES completed, current stats count: {len(profiler.get_stats())}")
+        except Exception as e:
+            self.logger.error(f"UPDATE_SAMPLES ProfileContext error: {e}", exc_info=True)
 
     def process_metrics(self):
         self.logger.info(f"POST_PROCESS_SAMPLES CALLED: len(raw_samples)={len(self.raw_samples)}, profiler.enabled={profiler._profiler.enabled}")
@@ -77,8 +105,8 @@ class MetricsProcessor(actor.BenchmarkActor):
             if len(profile_samples) > 0:
                 if self.profile_metrics_post_processor is None:
                     self.profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(self.metrics_store,
-                                                                                        self.workload.meta_data,
-                                                                                        self.test_procedure.meta_data)
+                                                                                        self.workload_meta_data,
+                                                                                        self.test_procedure_meta_data)
                 self.profile_metrics_post_processor(profile_samples)
 
 class SamplePostprocessor():
