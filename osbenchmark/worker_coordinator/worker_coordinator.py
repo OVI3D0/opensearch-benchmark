@@ -214,8 +214,10 @@ class StartMetricsProcessor:
     """
     Initializes the MetricsProcessor actor with necessary configuration.
     """
-    def __init__(self, metrics_store, downsample_factor, workload_meta_data, test_procedure_meta_data):
-        self.metrics_store = metrics_store
+    def __init__(self, config, workload_name, test_procedure_name, downsample_factor, workload_meta_data, test_procedure_meta_data):
+        self.config = config
+        self.workload_name = workload_name
+        self.test_procedure_name = test_procedure_name
         self.downsample_factor = downsample_factor
         self.workload_meta_data = workload_meta_data
         self.test_procedure_meta_data = test_procedure_meta_data
@@ -1117,7 +1119,9 @@ class WorkerCoordinator:
             mandatory=False, default_value=1))
         self.logger.info("Initializing MetricsProcessor actor with downsample_factor=%d", downsample_factor)
         self.target.send(self.target.metrics_actor, StartMetricsProcessor(
-            self.metrics_store,
+            self.config,
+            self.workload.name,
+            self.test_procedure.name,
             downsample_factor,
             self.workload.meta_data,
             self.test_procedure.meta_data

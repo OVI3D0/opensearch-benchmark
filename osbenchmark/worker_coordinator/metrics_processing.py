@@ -39,17 +39,29 @@ class MetricsProcessor(actor.BenchmarkActor):
         self.logger = logging.getLogger(__name__)
 
     def receiveMsg_StartMetricsProcessor(self, msg, sender) -> None:
+        from osbenchmark import metrics
+        from osbenchmark.worker_coordinator.worker_coordinator import load_local_config
+
         self.logger.info("MetricsProcessor starting with downsample_factor=%d", msg.downsample_factor)
         self.raw_samples = []
         self.raw_profile_samples = []
         self.most_recent_sample_per_client = {}
-        self.metrics_store = msg.metrics_store
+
+        # Create our own metrics_store from config
+        config = load_local_config(msg.config)
+        self.metrics_store = metrics.metrics_store(
+            cfg=config,
+            workload=msg.workload_name,
+            test_procedure=msg.test_procedure_name,
+            read_only=False
+        )
+
         self.workload_meta_data = msg.workload_meta_data
         self.test_procedure_meta_data = msg.test_procedure_meta_data
 
         # Create the sample post-processor
         self.sample_post_processor = DefaultSamplePostprocessor(
-            msg.metrics_store,
+            self.metrics_store,
             msg.downsample_factor,
             msg.workload_meta_data,
             msg.test_procedure_meta_data
@@ -78,6 +90,13 @@ class MetricsProcessor(actor.BenchmarkActor):
 
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Metrics Processor received ActorExitRequest. Shutting down...")
+        # Close metrics store if it exists
+        if hasattr(self, 'metrics_store') and self.metrics_store:
+            try:
+                self.metrics_store.close()
+                self.logger.info("MetricsProcessor closed metrics store successfully")
+            except Exception as e:
+                self.logger.warning("Error closing metrics store: %s", e)
     
     def update_samples(self, samples):
         self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
