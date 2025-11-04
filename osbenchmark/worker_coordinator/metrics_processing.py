@@ -376,6 +376,10 @@ class Sample:
     """
     Basic information used by metrics store to keep track of samples
     """
+    __slots__ = ('client_id', 'absolute_time', 'request_start', 'task_start', 'task',
+                 'sample_type', 'request_meta_data', 'time_period', '_dependent_timing',
+                 'percent_completed')
+
     def __init__(self, client_id, absolute_time, request_start, task_start, task, sample_type, request_meta_data,
                 time_period, percent_completed, dependent_timing=None):
         self.client_id = client_id
@@ -414,6 +418,9 @@ class DefaultSample(Sample):
     """
     Stores the operational and correctness metrics to later put into the metrics store
     """
+    __slots__ = ('latency', 'service_time', 'client_processing_time', 'processing_time',
+                 'throughput', 'total_ops', 'total_ops_unit')
+
     def __init__(self, client_id, absolute_time, request_start, task_start, task, sample_type, request_meta_data, latency,
                  service_time, client_processing_time, processing_time, throughput, total_ops, total_ops_unit, time_period,
                  percent_completed, dependent_timing=None):
@@ -443,6 +450,7 @@ class ProfileMetricsSample(Sample):
     """
     Stores the profile metrics to later put into the metrics store
     """
+    __slots__ = ()  # No additional attributes beyond Sample
 
     @property
     def dependent_timings(self):
