@@ -74,6 +74,7 @@ class MetricsProcessor(actor.BenchmarkActor):
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
     def receiveMsg_WakeupMessage(self, msg, sender) -> None:
+        self.logger.debug("MetricsProcessor received WakeupMessage")
         self.process_metrics()
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
@@ -136,7 +137,7 @@ class MetricsProcessor(actor.BenchmarkActor):
 
             # Periodically flush processed metrics to OpenSearch to prevent memory accumulation
             self.flush_counter += MetricsProcessor.WAKEUP_INTERVAL
-            self.logger.debug(f"Flush counter: {self.flush_counter}/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}")
+            self.logger.info(f"Flush counter: {self.flush_counter}/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}")
             if self.flush_counter >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
                 self.logger.info(f"Flushing metrics store (periodic flush every {MetricsProcessor.FLUSH_INTERVAL_SECONDS}s)")
                 try:
