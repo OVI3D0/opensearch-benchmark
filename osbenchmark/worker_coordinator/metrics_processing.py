@@ -38,7 +38,7 @@ class MetricsProcessor(actor.BenchmarkActor):
     def __init__(self) -> None:
         super().__init__()
         self.logger = logging.getLogger(__name__)
-        self.flush_counter = 0  # Counter to track when to flush
+        self.last_flush_time = None  # Track actual time of last flush
 
     def receiveMsg_StartMetricsProcessor(self, msg, sender) -> None:
         from osbenchmark import metrics
@@ -48,7 +48,7 @@ class MetricsProcessor(actor.BenchmarkActor):
         self.raw_samples = []
         self.raw_profile_samples = []
         self.most_recent_sample_per_client = {}
-        self.flush_counter = 0  # Initialize flush counter
+        self.last_flush_time = time.perf_counter()  # Initialize flush time tracker
 
         # Create our own metrics_store from config
         config = load_local_config(msg.config)
@@ -136,16 +136,18 @@ class MetricsProcessor(actor.BenchmarkActor):
                 self.profile_metrics_post_processor(profile_samples)
 
             # Periodically flush processed metrics to OpenSearch to prevent memory accumulation
-            self.flush_counter += MetricsProcessor.WAKEUP_INTERVAL
-            self.logger.info(f"Flush counter: {self.flush_counter}/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}")
-            if self.flush_counter >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
+            # Use real elapsed time instead of counter to handle slow processing
+            current_time = time.perf_counter()
+            elapsed_since_flush = current_time - self.last_flush_time
+            self.logger.info(f"Time since last flush: {elapsed_since_flush:.1f}s/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}s")
+            if elapsed_since_flush >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
                 self.logger.info(f"Flushing metrics store (periodic flush every {MetricsProcessor.FLUSH_INTERVAL_SECONDS}s)")
                 try:
                     self.metrics_store.flush(refresh=False)  # Don't refresh to save time
                     self.logger.info("Flush completed successfully")
+                    self.last_flush_time = current_time  # Reset timer
                 except Exception as e:
                     self.logger.error(f"Error during flush: {e}", exc_info=True)
-                self.flush_counter = 0
 
 class SamplePostprocessor():
     """
