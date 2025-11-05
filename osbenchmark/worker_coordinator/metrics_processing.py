@@ -126,8 +126,10 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
             # This ensures we flush periodically regardless of sample arrival rate
             current_time = time.perf_counter()
             if current_time - last_flush_time >= 30:  # Flush every 30 seconds
+                print(f"[WORKER {worker_id}] Flushing after processing {processed_count} samples", file=sys.stderr, flush=True)
                 logger.info(f"Worker {worker_id} flushing after processing {processed_count} samples")
                 metrics_store.flush(refresh=False)
+                print(f"[WORKER {worker_id}] Flush complete", file=sys.stderr, flush=True)
                 last_flush_time = current_time
                 processed_count = 0
 
