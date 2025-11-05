@@ -48,6 +48,7 @@ class MetricsProcessor(actor.BenchmarkActor):
         self.raw_samples = []
         self.raw_profile_samples = []
         self.most_recent_sample_per_client = {}
+        self.flush_counter = 0  # Initialize flush counter
 
         # Create our own metrics_store from config
         config = load_local_config(msg.config)
@@ -135,9 +136,14 @@ class MetricsProcessor(actor.BenchmarkActor):
 
             # Periodically flush processed metrics to OpenSearch to prevent memory accumulation
             self.flush_counter += MetricsProcessor.WAKEUP_INTERVAL
+            self.logger.debug(f"Flush counter: {self.flush_counter}/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}")
             if self.flush_counter >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
                 self.logger.info(f"Flushing metrics store (periodic flush every {MetricsProcessor.FLUSH_INTERVAL_SECONDS}s)")
-                self.metrics_store.flush(refresh=False)  # Don't refresh to save time
+                try:
+                    self.metrics_store.flush(refresh=False)  # Don't refresh to save time
+                    self.logger.info("Flush completed successfully")
+                except Exception as e:
+                    self.logger.error(f"Error during flush: {e}", exc_info=True)
                 self.flush_counter = 0
 
 class SamplePostprocessor():
