@@ -34,7 +34,7 @@ from osbenchmark.utils import convert
 
 class MetricsProcessor(actor.BenchmarkActor):
     WAKEUP_INTERVAL = 1
-    FLUSH_INTERVAL_SECONDS = 60  # Flush metrics to OpenSearch every 60 seconds
+    FLUSH_INTERVAL_SECONDS = 30  # Flush metrics to OpenSearch every 30 seconds (reduced from 60 to keep memory lower)
 
     def __init__(self) -> None:
         super().__init__()
@@ -175,7 +175,10 @@ class MetricsProcessor(actor.BenchmarkActor):
         elapsed_since_flush = current_time - self.last_flush_time
 
         if elapsed_since_flush >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
-            self.logger.info(f"Time since last flush: {elapsed_since_flush:.1f}s - Flushing now")
+            # Log metrics store size before flush
+            doc_count = len(self.metrics_store._docs) if hasattr(self.metrics_store, '_docs') else 0
+            queue_size = self.sample_queue.qsize() if self.sample_queue else 0
+            self.logger.info(f"Time since last flush: {elapsed_since_flush:.1f}s - Flushing now (processed docs: {doc_count:,}, queue size: {queue_size})")
             try:
                 self.metrics_store.flush(refresh=False)  # Don't refresh to save time
                 self.logger.info("Flush completed successfully")
