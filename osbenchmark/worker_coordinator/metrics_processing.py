@@ -24,27 +24,127 @@
 import datetime
 import itertools
 import logging
+import multiprocessing
+import os
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 
 import time
 
 from osbenchmark import actor, profiler
 from osbenchmark.utils import convert
 
+
+def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, workload_name,
+                   test_procedure_name, downsample_factor, workload_meta_data, test_procedure_meta_data):
+    """
+    Worker process that continuously processes samples from the queue.
+    Each worker has its own metrics_store and writes directly to OpenSearch.
+    Runs until shutdown_event is set.
+    """
+    import logging
+    import queue as queue_module
+    from osbenchmark import metrics
+    from osbenchmark.worker_coordinator.worker_coordinator import load_local_config
+    from osbenchmark.worker_coordinator.metrics_processing import DefaultSamplePostprocessor, ProfileMetricsSamplePostprocessor
+
+    logger = logging.getLogger(f"{__name__}.worker{worker_id}")
+    logger.info(f"Worker process {worker_id} started (PID: {os.getpid()})")
+
+    try:
+        # Create this worker's own metrics_store
+        config = load_local_config(config_dict)
+        metrics_store = metrics.metrics_store(
+            cfg=config,
+            workload=workload_name,
+            test_procedure=test_procedure_name,
+            read_only=False
+        )
+
+        # Create sample post-processor
+        sample_post_processor = DefaultSamplePostprocessor(
+            metrics_store,
+            downsample_factor,
+            workload_meta_data,
+            test_procedure_meta_data
+        )
+
+        profile_metrics_post_processor = None
+        last_flush_time = time.perf_counter()
+        processed_count = 0
+
+        while not shutdown_event.is_set():
+            try:
+                # Get samples from queue with timeout
+                samples, profile_samples = sample_queue.get(timeout=1)
+
+                # Process samples immediately
+                if len(samples) > 0:
+                    sample_post_processor(samples)
+                    processed_count += len(samples)
+
+                # Process profile samples
+                if len(profile_samples) > 0:
+                    if profile_metrics_post_processor is None:
+                        profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(
+                            metrics_store,
+                            workload_meta_data,
+                            test_procedure_meta_data
+                        )
+                    profile_metrics_post_processor(profile_samples)
+
+                # Periodically flush this worker's metrics_store
+                current_time = time.perf_counter()
+                if current_time - last_flush_time >= 30:  # Flush every 30 seconds
+                    logger.info(f"Worker {worker_id} flushing after processing {processed_count} samples")
+                    metrics_store.flush(refresh=False)
+                    last_flush_time = current_time
+                    processed_count = 0
+
+            except queue_module.Empty:
+                # No samples available, loop back and check shutdown_event
+                continue
+            except Exception as e:
+                logger.error(f"Error in worker {worker_id}: {e}", exc_info=True)
+
+        # Final flush before shutdown
+        logger.info(f"Worker {worker_id} shutting down, final flush")
+        metrics_store.flush(refresh=True)
+        metrics_store.close()
+        logger.info(f"Worker {worker_id} shut down")
+
+    except Exception as e:
+        logger.error(f"Fatal error in worker {worker_id}: {e}", exc_info=True)
+
+
 class MetricsProcessor(actor.BenchmarkActor):
     WAKEUP_INTERVAL = 1
     FLUSH_INTERVAL_SECONDS = 30  # Flush metrics to OpenSearch every 30 seconds (reduced from 60 to keep memory lower)
-    NUM_PROCESSING_THREADS = 8  # Use 8 threads to process samples in parallel (increased from 4 due to queue buildup)
+
+    @staticmethod
+    def _get_num_processing_workers():
+        """Auto-detect number of processing workers based on CPU count"""
+        # Use environment variable if set, otherwise auto-detect
+        env_workers = os.getenv('OSB_METRICS_WORKERS')
+        if env_workers:
+            return int(env_workers)
+
+        # Use half of CPU cores (leave headroom for workers and other processes)
+        cpu_count = os.cpu_count() or 4
+        return max(4, min(cpu_count // 2, 16))  # Minimum 4, maximum 16 or half of cores
 
     def __init__(self) -> None:
         super().__init__()
         self.logger = logging.getLogger(__name__)
         self.last_flush_time = None  # Track actual time of last flush
-        self.sample_queue = None  # Thread-safe queue for samples
-        self.thread_pool = None  # Thread pool for parallel processing
-        self.shutdown_event = None  # Signal to stop processing threads
+        self.sample_queue = None  # Multiprocessing queue for samples
+        self.process_pool = None  # Process pool for parallel processing
+        self.shutdown_event = None  # Signal to stop processing workers
+        self.config_dict = None  # Serialized config for worker processes
+        self.workload_meta_data = None
+        self.test_procedure_meta_data = None
+        self.downsample_factor = None
 
     def receiveMsg_StartMetricsProcessor(self, msg, sender) -> None:
         from osbenchmark import metrics
@@ -54,11 +154,17 @@ class MetricsProcessor(actor.BenchmarkActor):
         self.most_recent_sample_per_client = {}
         self.last_flush_time = time.perf_counter()  # Initialize flush time tracker
 
-        # Create thread-safe queue and shutdown event
-        self.sample_queue = queue.Queue()
-        self.shutdown_event = threading.Event()
+        # Store config for worker processes
+        self.config_dict = msg.config
+        self.downsample_factor = msg.downsample_factor
+        self.workload_meta_data = msg.workload_meta_data
+        self.test_procedure_meta_data = msg.test_procedure_meta_data
 
-        # Create our own metrics_store from config
+        # Create multiprocessing queue and shutdown event
+        self.sample_queue = multiprocessing.Manager().Queue()
+        self.shutdown_event = multiprocessing.Event()
+
+        # Create our own metrics_store from config (for flushing tracking only)
         config = load_local_config(msg.config)
         self.metrics_store = metrics.metrics_store(
             cfg=config,
@@ -79,16 +185,32 @@ class MetricsProcessor(actor.BenchmarkActor):
         )
         self.profile_metrics_post_processor = None
 
-        # Start thread pool for parallel processing
-        self.thread_pool = ThreadPoolExecutor(
-            max_workers=MetricsProcessor.NUM_PROCESSING_THREADS,
-            thread_name_prefix="MetricsProcessor"
-        )
-        self.logger.info(f"Started thread pool with {MetricsProcessor.NUM_PROCESSING_THREADS} worker threads")
+        # Auto-detect number of processing workers
+        num_workers = MetricsProcessor._get_num_processing_workers()
 
-        # Start threads to consume from queue
-        for i in range(MetricsProcessor.NUM_PROCESSING_THREADS):
-            self.thread_pool.submit(self._process_samples_continuously, i)
+        # Start process pool for TRUE parallel processing (bypasses GIL)
+        self.process_pool = ProcessPoolExecutor(
+            max_workers=num_workers,
+            mp_context=multiprocessing.get_context('spawn')  # Use spawn to avoid fork issues
+        )
+        self.logger.info(f"Started process pool with {num_workers} worker processes (CPUs: {os.cpu_count()})")
+
+        # Submit worker processes that will run continuously
+        self.worker_futures = []
+        for i in range(num_workers):
+            future = self.process_pool.submit(
+                _process_worker,
+                i,
+                self.sample_queue,
+                self.shutdown_event,
+                self.config_dict,
+                msg.workload_name,
+                msg.test_procedure_name,
+                msg.downsample_factor,
+                msg.workload_meta_data,
+                msg.test_procedure_meta_data
+            )
+            self.worker_futures.append(future)
 
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
@@ -114,15 +236,15 @@ class MetricsProcessor(actor.BenchmarkActor):
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Metrics Processor received ActorExitRequest. Shutting down...")
 
-        # Signal processing threads to stop
+        # Signal processing workers to stop
         if self.shutdown_event:
             self.shutdown_event.set()
 
-        # Shutdown thread pool
-        if self.thread_pool:
-            self.logger.info("Shutting down thread pool...")
-            self.thread_pool.shutdown(wait=True, timeout=30)
-            self.logger.info("Thread pool shut down")
+        # Shutdown process pool
+        if self.process_pool:
+            self.logger.info("Shutting down process pool...")
+            self.process_pool.shutdown(wait=True, timeout=30)
+            self.logger.info("Process pool shut down")
 
         # Flush any remaining metrics before closing
         if hasattr(self, 'metrics_store') and self.metrics_store:
@@ -135,61 +257,19 @@ class MetricsProcessor(actor.BenchmarkActor):
             except Exception as e:
                 self.logger.warning("Error flushing/closing metrics store: %s", e)
     
-    def _process_samples_continuously(self, thread_id):
-        """
-        Background thread that continuously processes samples from the queue.
-        Runs until shutdown_event is set.
-        """
-        self.logger.info(f"Processing thread {thread_id} started")
-
-        while not self.shutdown_event.is_set():
-            try:
-                # Get samples from queue with timeout so we can check shutdown_event
-                samples, profile_samples = self.sample_queue.get(timeout=1)
-
-                # Process samples immediately
-                if len(samples) > 0:
-                    with profiler.ProfileContext("process_samples"):
-                        self.sample_post_processor(samples)
-
-                # Process profile samples
-                if len(profile_samples) > 0:
-                    if self.profile_metrics_post_processor is None:
-                        self.profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(
-                            self.metrics_store,
-                            self.workload_meta_data,
-                            self.test_procedure_meta_data
-                        )
-                    self.profile_metrics_post_processor(profile_samples)
-
-                self.sample_queue.task_done()
-
-            except queue.Empty:
-                # No samples available, loop back and check shutdown_event
-                continue
-            except Exception as e:
-                self.logger.error(f"Error processing samples in thread {thread_id}: {e}", exc_info=True)
-
-        self.logger.info(f"Processing thread {thread_id} shutting down")
 
     def _check_and_flush(self):
-        """Check if it's time to flush and flush if needed"""
+        """Check queue size and log status (workers handle their own flushing)"""
         current_time = time.perf_counter()
-        elapsed_since_flush = current_time - self.last_flush_time
+        elapsed_since_last_check = current_time - self.last_flush_time
 
-        if elapsed_since_flush >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
-            # Log metrics store size before flush
-            doc_count = len(self.metrics_store._docs) if hasattr(self.metrics_store, '_docs') else 0
+        if elapsed_since_last_check >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
+            # Just log queue status - workers flush independently
             queue_size = self.sample_queue.qsize() if self.sample_queue else 0
-            self.logger.info(f"Time since last flush: {elapsed_since_flush:.1f}s - Flushing now (processed docs: {doc_count:,}, queue size: {queue_size})")
-            try:
-                self.metrics_store.flush(refresh=False)  # Don't refresh to save time
-                self.logger.info("Flush completed successfully")
-                self.last_flush_time = current_time  # Reset timer
-            except Exception as e:
-                self.logger.error(f"Error during flush: {e}", exc_info=True)
+            self.logger.info(f"Queue status check: queue size = {queue_size}")
+            self.last_flush_time = current_time
         else:
-            self.logger.debug(f"Time since last flush: {elapsed_since_flush:.1f}s/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}s")
+            self.logger.debug(f"Time since last check: {elapsed_since_last_check:.1f}s/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}s")
 
 class SamplePostprocessor():
     """
