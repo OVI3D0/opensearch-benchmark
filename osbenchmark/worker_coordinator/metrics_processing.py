@@ -36,7 +36,7 @@ from osbenchmark.utils import convert
 class MetricsProcessor(actor.BenchmarkActor):
     WAKEUP_INTERVAL = 1
     FLUSH_INTERVAL_SECONDS = 30  # Flush metrics to OpenSearch every 30 seconds (reduced from 60 to keep memory lower)
-    NUM_PROCESSING_THREADS = 4  # Use 4 threads to process samples in parallel
+    NUM_PROCESSING_THREADS = 8  # Use 8 threads to process samples in parallel (increased from 4 due to queue buildup)
 
     def __init__(self) -> None:
         super().__init__()
