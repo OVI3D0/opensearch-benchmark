@@ -1013,7 +1013,10 @@ class WorkerCoordinator:
 
         os_default = opensearch["default"]
 
-        if enable:
+        # NOTE: Telemetry devices require metrics_store which is now None since MetricsProcessor handles all metrics.
+        # Disable telemetry device creation until telemetry is updated to work with MetricsProcessor.
+        if enable and self.metrics_store is not None:
+            self.logger.info("Creating telemetry devices (metrics_store available)")
             devices = [
                 telemetry.NodeStats(telemetry_params, opensearch, self.metrics_store),
                 telemetry.ExternalEnvironmentInfo(os_default, self.metrics_store),
@@ -1030,6 +1033,9 @@ class WorkerCoordinator:
                 telemetry.ShardStats(telemetry_params, opensearch, self.metrics_store)
             ]
         else:
+            if enable and self.metrics_store is None:
+                self.logger.warning("Telemetry requested but metrics_store is None (MetricsProcessor handles metrics now). "
+                                   "Telemetry devices disabled until updated to work with MetricsProcessor.")
             devices = []
         self.telemetry = telemetry.Telemetry(enabled_devices, devices=devices)
 
@@ -1053,13 +1059,16 @@ class WorkerCoordinator:
         self.workload = t
         self.test_procedure = select_test_procedure(self.config, self.workload)
         self.quiet = self.config.opts("system", "quiet.mode", mandatory=False, default_value=False)
-        downsample_factor = int(self.config.opts(
-            "reporting", "metrics.request.downsample.factor",
-            mandatory=False, default_value=1))
-        self.metrics_store = metrics.metrics_store(cfg=self.config,
-                                                   workload=self.workload.name,
-                                                   test_procedure=self.test_procedure.name,
-                                                   read_only=False)
+
+        # ALL metrics handling now done by MetricsProcessor actor - WorkerCoordinator doesn't need metrics_store
+        # downsample_factor = int(self.config.opts(
+        #     "reporting", "metrics.request.downsample.factor",
+        #     mandatory=False, default_value=1))
+        # self.metrics_store = metrics.metrics_store(cfg=self.config,
+        #                                            workload=self.workload.name,
+        #                                            test_procedure=self.test_procedure.name,
+        #                                            read_only=False)
+        self.metrics_store = None  # No longer used - MetricsProcessor handles all metrics
 
         # Sample post-processing now handled by MetricsProcessor actor
         # self.sample_post_processor = DefaultSamplePostprocessor(self.metrics_store,
@@ -1194,16 +1203,18 @@ class WorkerCoordinator:
         if redline_enabled:
             metrics_index = None
             test_run_id = None
-            # we must have a metrics store connected for CPU based feedback
+            # TODO: Redline feature needs metrics store access - needs to be updated for MetricsProcessor
             cpu_max = self.config.opts("workload", "redline.max_cpu_usage", default_value=None, mandatory=False)
-            if cpu_max and isinstance(self.metrics_store, metrics.InMemoryMetricsStore):
-                raise exceptions.SystemSetupError("CPU-based feedback requires a metrics store. You are using an in-memory metrics store")
-            elif cpu_max and "node-stats" not in self.config.opts("telemetry", "devices"):
-                raise exceptions.SystemSetupError("Node stats telemetry not enabled — this is required for CPU-based redline feedback.")
-            elif cpu_max and isinstance(self.metrics_store, metrics.OsMetricsStore):
-                # pass over the index and test run ID so the feedbackActor can query the datastore
-                metrics_index = self.metrics_store.index
-                test_run_id = self.metrics_store.test_run_id
+            # if cpu_max and isinstance(self.metrics_store, metrics.InMemoryMetricsStore):
+            #     raise exceptions.SystemSetupError("CPU-based feedback requires a metrics store. You are using an in-memory metrics store")
+            # elif cpu_max and "node-stats" not in self.config.opts("telemetry", "devices"):
+            #     raise exceptions.SystemSetupError("Node stats telemetry not enabled — this is required for CPU-based redline feedback.")
+            # elif cpu_max and isinstance(self.metrics_store, metrics.OsMetricsStore):
+            #     # pass over the index and test run ID so the feedbackActor can query the datastore
+            #     metrics_index = self.metrics_store.index
+            #     test_run_id = self.metrics_store.test_run_id
+            metrics_index = None  # TODO: Get from MetricsProcessor if needed
+            test_run_id = None
 
             scale_step = self.config.opts("workload", "redline.scale_step", default_value=0)
             scale_down_pct = self.config.opts("workload", "redline.scale_down_pct", default_value=0)
@@ -1255,13 +1266,11 @@ class WorkerCoordinator:
             if self.finished():
                 self.telemetry.on_benchmark_stop()
                 self.logger.info("All steps completed.")
-                # Some metrics store implementations return None because no external representation is required.
-                # pylint: disable=assignment-from-none
-                m = self.metrics_store.to_externalizable(clear=True)
-                self.logger.debug("Closing metrics store...")
-                self.metrics_store.close()
-                # immediately clear as we don't need it anymore and it can consume a significant amount of memory
-                self.metrics_store = None
+                # TODO: Get metrics from MetricsProcessor actor instead
+                # Metrics are now handled by MetricsProcessor actor, not WorkerCoordinator
+                # self.metrics_store.to_externalizable(clear=True)
+                # self.metrics_store.close()
+                m = None  # MetricsProcessor handles metrics, not WorkerCoordinator
                 self.logger.debug("Sending benchmark results...")
                 self.target.on_benchmark_complete(m)
             else:
@@ -1282,9 +1291,9 @@ class WorkerCoordinator:
             # Assumption: We don't have a lot of clock skew between reaching the join point and sending the next task
             #             (it doesn't matter too much if we're a few ms off).
             waiting_period = 1.0
-        # Some metrics store implementations return None because no external representation is required.
-        # pylint: disable=assignment-from-none
-        m = self.metrics_store.to_externalizable(clear=True)
+        # TODO: Get metrics from MetricsProcessor actor instead
+        # Metrics are now handled by MetricsProcessor actor, not WorkerCoordinator
+        m = None  # MetricsProcessor handles metrics, not WorkerCoordinator
         self.target.on_task_finished(m, waiting_period)
         # Using a perf_counter here is fine also in the distributed case as we subtract it from `master_received_msg_at` making it
         # a relative instead of an absolute value.
@@ -1329,8 +1338,10 @@ class WorkerCoordinator:
                     self.logger.info("Client id(s) [%s] did not yet finish.", ",".join(map(str, pending_client_ids)))
 
     def reset_relative_time(self):
+        # TODO: Send reset_relative_time message to MetricsProcessor actor if needed
+        # Metrics are now handled by MetricsProcessor actor, not WorkerCoordinator
         self.logger.debug("Resetting relative time of request metrics store.")
-        self.metrics_store.reset_relative_time()
+        # self.metrics_store.reset_relative_time()
 
     def finished(self):
         return self.current_step == self.number_of_steps
@@ -1340,8 +1351,10 @@ class WorkerCoordinator:
             return
         self._closed = True
         self.progress_publisher.finish()
-        if self.metrics_store and self.metrics_store.opened:
-            self.metrics_store.close()
+        # TODO: Send close message to MetricsProcessor actor if needed
+        # Metrics are now handled by MetricsProcessor actor, not WorkerCoordinator
+        # if self.metrics_store and self.metrics_store.opened:
+        #     self.metrics_store.close()
 
         # Write profiling results from coordinator process (only once)
         if profiler._profiler.enabled and not hasattr(self, '_profiling_written'):
