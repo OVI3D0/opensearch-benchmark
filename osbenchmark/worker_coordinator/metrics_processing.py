@@ -33,10 +33,12 @@ from osbenchmark.utils import convert
 
 class MetricsProcessor(actor.BenchmarkActor):
     WAKEUP_INTERVAL = 1
+    FLUSH_INTERVAL_SECONDS = 60  # Flush metrics to OpenSearch every 60 seconds
 
     def __init__(self) -> None:
         super().__init__()
         self.logger = logging.getLogger(__name__)
+        self.flush_counter = 0  # Counter to track when to flush
 
     def receiveMsg_StartMetricsProcessor(self, msg, sender) -> None:
         from osbenchmark import metrics
@@ -90,13 +92,16 @@ class MetricsProcessor(actor.BenchmarkActor):
 
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Metrics Processor received ActorExitRequest. Shutting down...")
-        # Close metrics store if it exists
+        # Flush any remaining metrics before closing
         if hasattr(self, 'metrics_store') and self.metrics_store:
             try:
+                self.logger.info("Final flush of metrics store before shutdown...")
+                self.metrics_store.flush(refresh=True)
+                self.logger.info("MetricsProcessor flushed metrics store successfully")
                 self.metrics_store.close()
                 self.logger.info("MetricsProcessor closed metrics store successfully")
             except Exception as e:
-                self.logger.warning("Error closing metrics store: %s", e)
+                self.logger.warning("Error flushing/closing metrics store: %s", e)
     
     def update_samples(self, samples):
         self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
@@ -127,6 +132,13 @@ class MetricsProcessor(actor.BenchmarkActor):
                                                                                         self.workload_meta_data,
                                                                                         self.test_procedure_meta_data)
                 self.profile_metrics_post_processor(profile_samples)
+
+            # Periodically flush processed metrics to OpenSearch to prevent memory accumulation
+            self.flush_counter += MetricsProcessor.WAKEUP_INTERVAL
+            if self.flush_counter >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
+                self.logger.info(f"Flushing metrics store (periodic flush every {MetricsProcessor.FLUSH_INTERVAL_SECONDS}s)")
+                self.metrics_store.flush(refresh=False)  # Don't refresh to save time
+                self.flush_counter = 0
 
 class SamplePostprocessor():
     """
