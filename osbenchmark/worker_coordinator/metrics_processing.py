@@ -26,6 +26,7 @@ import itertools
 import logging
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import time
 
@@ -35,14 +36,15 @@ from osbenchmark.utils import convert
 class MetricsProcessor(actor.BenchmarkActor):
     WAKEUP_INTERVAL = 1
     FLUSH_INTERVAL_SECONDS = 30  # Flush metrics to OpenSearch every 30 seconds (reduced from 60 to keep memory lower)
+    NUM_PROCESSING_THREADS = 4  # Use 4 threads to process samples in parallel
 
     def __init__(self) -> None:
         super().__init__()
         self.logger = logging.getLogger(__name__)
         self.last_flush_time = None  # Track actual time of last flush
         self.sample_queue = None  # Thread-safe queue for samples
-        self.processing_thread = None  # Background processing thread
-        self.shutdown_event = None  # Signal to stop processing thread
+        self.thread_pool = None  # Thread pool for parallel processing
+        self.shutdown_event = None  # Signal to stop processing threads
 
     def receiveMsg_StartMetricsProcessor(self, msg, sender) -> None:
         from osbenchmark import metrics
@@ -77,14 +79,16 @@ class MetricsProcessor(actor.BenchmarkActor):
         )
         self.profile_metrics_post_processor = None
 
-        # Start background processing thread
-        self.processing_thread = threading.Thread(
-            target=self._process_samples_continuously,
-            name="MetricsProcessorThread",
-            daemon=True
+        # Start thread pool for parallel processing
+        self.thread_pool = ThreadPoolExecutor(
+            max_workers=MetricsProcessor.NUM_PROCESSING_THREADS,
+            thread_name_prefix="MetricsProcessor"
         )
-        self.processing_thread.start()
-        self.logger.info("Background processing thread started")
+        self.logger.info(f"Started thread pool with {MetricsProcessor.NUM_PROCESSING_THREADS} worker threads")
+
+        # Start threads to consume from queue
+        for i in range(MetricsProcessor.NUM_PROCESSING_THREADS):
+            self.thread_pool.submit(self._process_samples_continuously, i)
 
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
@@ -110,16 +114,15 @@ class MetricsProcessor(actor.BenchmarkActor):
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Metrics Processor received ActorExitRequest. Shutting down...")
 
-        # Signal processing thread to stop
+        # Signal processing threads to stop
         if self.shutdown_event:
             self.shutdown_event.set()
 
-        # Wait for processing thread to finish (with timeout)
-        if self.processing_thread and self.processing_thread.is_alive():
-            self.logger.info("Waiting for processing thread to finish...")
-            self.processing_thread.join(timeout=30)
-            if self.processing_thread.is_alive():
-                self.logger.warning("Processing thread did not finish in time")
+        # Shutdown thread pool
+        if self.thread_pool:
+            self.logger.info("Shutting down thread pool...")
+            self.thread_pool.shutdown(wait=True, timeout=30)
+            self.logger.info("Thread pool shut down")
 
         # Flush any remaining metrics before closing
         if hasattr(self, 'metrics_store') and self.metrics_store:
@@ -132,12 +135,12 @@ class MetricsProcessor(actor.BenchmarkActor):
             except Exception as e:
                 self.logger.warning("Error flushing/closing metrics store: %s", e)
     
-    def _process_samples_continuously(self):
+    def _process_samples_continuously(self, thread_id):
         """
         Background thread that continuously processes samples from the queue.
         Runs until shutdown_event is set.
         """
-        self.logger.info("Background processing thread running")
+        self.logger.info(f"Processing thread {thread_id} started")
 
         while not self.shutdown_event.is_set():
             try:
@@ -165,9 +168,9 @@ class MetricsProcessor(actor.BenchmarkActor):
                 # No samples available, loop back and check shutdown_event
                 continue
             except Exception as e:
-                self.logger.error(f"Error processing samples in background thread: {e}", exc_info=True)
+                self.logger.error(f"Error processing samples in thread {thread_id}: {e}", exc_info=True)
 
-        self.logger.info("Background processing thread shutting down")
+        self.logger.info(f"Processing thread {thread_id} shutting down")
 
     def _check_and_flush(self):
         """Check if it's time to flush and flush if needed"""
