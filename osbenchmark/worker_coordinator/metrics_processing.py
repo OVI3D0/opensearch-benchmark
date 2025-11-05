@@ -47,7 +47,8 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
     import queue as queue_module
     from osbenchmark import metrics
     from osbenchmark.worker_coordinator.worker_coordinator import load_local_config
-    from osbenchmark.worker_coordinator.metrics_processing import DefaultSamplePostprocessor, ProfileMetricsSamplePostprocessor
+    # Import the classes - they're defined later in this module
+    import osbenchmark.worker_coordinator.metrics_processing as mp_module
 
     logger = logging.getLogger(f"{__name__}.worker{worker_id}")
     logger.info(f"Worker process {worker_id} started (PID: {os.getpid()})")
@@ -63,7 +64,7 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
         )
 
         # Create sample post-processor
-        sample_post_processor = DefaultSamplePostprocessor(
+        sample_post_processor = mp_module.DefaultSamplePostprocessor(
             metrics_store,
             downsample_factor,
             workload_meta_data,
@@ -87,7 +88,7 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
                 # Process profile samples
                 if len(profile_samples) > 0:
                     if profile_metrics_post_processor is None:
-                        profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(
+                        profile_metrics_post_processor = mp_module.ProfileMetricsSamplePostprocessor(
                             metrics_store,
                             workload_meta_data,
                             test_procedure_meta_data
@@ -215,8 +216,16 @@ class MetricsProcessor(actor.BenchmarkActor):
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
     def receiveMsg_WakeupMessage(self, msg, sender) -> None:
-        # Now only used for periodic flushing, not processing
-        self.logger.debug("MetricsProcessor checking flush timer")
+        # Check if any worker processes failed
+        if hasattr(self, 'worker_futures'):
+            for i, future in enumerate(self.worker_futures):
+                if future.done():
+                    try:
+                        future.result()  # This will raise if worker failed
+                    except Exception as e:
+                        self.logger.error(f"Worker process {i} failed: {e}", exc_info=True)
+
+        # Check queue status
         self._check_and_flush()
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
