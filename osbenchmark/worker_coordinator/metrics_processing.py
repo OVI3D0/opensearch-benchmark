@@ -25,6 +25,7 @@ import datetime
 import itertools
 import logging
 import queue
+import threading
 
 import time
 
@@ -39,16 +40,21 @@ class MetricsProcessor(actor.BenchmarkActor):
         super().__init__()
         self.logger = logging.getLogger(__name__)
         self.last_flush_time = None  # Track actual time of last flush
+        self.sample_queue = None  # Thread-safe queue for samples
+        self.processing_thread = None  # Background processing thread
+        self.shutdown_event = None  # Signal to stop processing thread
 
     def receiveMsg_StartMetricsProcessor(self, msg, sender) -> None:
         from osbenchmark import metrics
         from osbenchmark.worker_coordinator.worker_coordinator import load_local_config
 
         self.logger.info("MetricsProcessor starting with downsample_factor=%d", msg.downsample_factor)
-        self.raw_samples = []
-        self.raw_profile_samples = []
         self.most_recent_sample_per_client = {}
         self.last_flush_time = time.perf_counter()  # Initialize flush time tracker
+
+        # Create thread-safe queue and shutdown event
+        self.sample_queue = queue.Queue()
+        self.shutdown_event = threading.Event()
 
         # Create our own metrics_store from config
         config = load_local_config(msg.config)
@@ -71,29 +77,50 @@ class MetricsProcessor(actor.BenchmarkActor):
         )
         self.profile_metrics_post_processor = None
 
+        # Start background processing thread
+        self.processing_thread = threading.Thread(
+            target=self._process_samples_continuously,
+            name="MetricsProcessorThread",
+            daemon=True
+        )
+        self.processing_thread.start()
+        self.logger.info("Background processing thread started")
+
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
     def receiveMsg_WakeupMessage(self, msg, sender) -> None:
-        self.logger.debug("MetricsProcessor received WakeupMessage")
-        self.process_metrics()
+        # Now only used for periodic flushing, not processing
+        self.logger.debug("MetricsProcessor checking flush timer")
+        self._check_and_flush()
         self.wakeupAfter(datetime.timedelta(seconds=MetricsProcessor.WAKEUP_INTERVAL))
 
     def receiveMsg_UpdateSamples(self, msg, sender) -> None:
+        # Just add samples to queue - returns immediately!
         samples = msg.samples
-        self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
-        try:
-            with profiler.ProfileContext("update_samples"):
-                if len(samples) > 0:
-                    self.raw_samples += samples
-                    # We need to check all samples, they will be from different clients
-                    for s in samples:
-                        self.most_recent_sample_per_client[s.client_id] = s
-            self.logger.info(f"UPDATE_SAMPLES completed, current stats count: {len(profiler.get_stats())}")
-        except Exception as e:
-            self.logger.error(f"UPDATE_SAMPLES ProfileContext error: {e}", exc_info=True)
+        profile_samples = msg.profile_samples
+
+        if len(samples) > 0 or len(profile_samples) > 0:
+            self.sample_queue.put((samples, profile_samples))
+            self.logger.debug(f"Queued {len(samples)} samples, {len(profile_samples)} profile samples (queue size: {self.sample_queue.qsize()})")
+
+        # Update most recent sample per client (thread-safe, only read by this actor)
+        for s in samples:
+            self.most_recent_sample_per_client[s.client_id] = s
 
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Metrics Processor received ActorExitRequest. Shutting down...")
+
+        # Signal processing thread to stop
+        if self.shutdown_event:
+            self.shutdown_event.set()
+
+        # Wait for processing thread to finish (with timeout)
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.logger.info("Waiting for processing thread to finish...")
+            self.processing_thread.join(timeout=30)
+            if self.processing_thread.is_alive():
+                self.logger.warning("Processing thread did not finish in time")
+
         # Flush any remaining metrics before closing
         if hasattr(self, 'metrics_store') and self.metrics_store:
             try:
@@ -105,49 +132,58 @@ class MetricsProcessor(actor.BenchmarkActor):
             except Exception as e:
                 self.logger.warning("Error flushing/closing metrics store: %s", e)
     
-    def update_samples(self, samples):
-        self.logger.info(f"UPDATE_SAMPLES CALLED: len(samples)={len(samples)}, profiler.enabled={profiler._profiler.enabled}")
-        try:
-            with profiler.ProfileContext("update_samples"):
+    def _process_samples_continuously(self):
+        """
+        Background thread that continuously processes samples from the queue.
+        Runs until shutdown_event is set.
+        """
+        self.logger.info("Background processing thread running")
+
+        while not self.shutdown_event.is_set():
+            try:
+                # Get samples from queue with timeout so we can check shutdown_event
+                samples, profile_samples = self.sample_queue.get(timeout=1)
+
+                # Process samples immediately
                 if len(samples) > 0:
-                    self.raw_samples += samples
-                    # We need to check all samples, they will be from different clients
-                    for s in samples:
-                        self.most_recent_sample_per_client[s.client_id] = s
-            self.logger.info(f"UPDATE_SAMPLES completed, current stats count: {len(profiler.get_stats())}")
-        except Exception as e:
-            self.logger.error(f"UPDATE_SAMPLES ProfileContext error: {e}", exc_info=True)
+                    with profiler.ProfileContext("process_samples"):
+                        self.sample_post_processor(samples)
 
-    def process_metrics(self):
-        self.logger.info(f"POST_PROCESS_SAMPLES CALLED: len(raw_samples)={len(self.raw_samples)}, profiler.enabled={profiler._profiler.enabled}")
-        with profiler.ProfileContext("post_process_samples"):
-            # we do *not* do this here to avoid concurrent updates (actors are single-threaded) but rather to make it clear that we use
-            # only a snapshot and that new data will go to a new sample set.
-            raw_samples = self.raw_samples
-            self.raw_samples = []
-            self.sample_post_processor(raw_samples)
-            profile_samples = self.raw_profile_samples
-            self.raw_profile_samples = []
-            if len(profile_samples) > 0:
-                if self.profile_metrics_post_processor is None:
-                    self.profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(self.metrics_store,
-                                                                                        self.workload_meta_data,
-                                                                                        self.test_procedure_meta_data)
-                self.profile_metrics_post_processor(profile_samples)
+                # Process profile samples
+                if len(profile_samples) > 0:
+                    if self.profile_metrics_post_processor is None:
+                        self.profile_metrics_post_processor = ProfileMetricsSamplePostprocessor(
+                            self.metrics_store,
+                            self.workload_meta_data,
+                            self.test_procedure_meta_data
+                        )
+                    self.profile_metrics_post_processor(profile_samples)
 
-            # Periodically flush processed metrics to OpenSearch to prevent memory accumulation
-            # Use real elapsed time instead of counter to handle slow processing
-            current_time = time.perf_counter()
-            elapsed_since_flush = current_time - self.last_flush_time
-            self.logger.info(f"Time since last flush: {elapsed_since_flush:.1f}s/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}s")
-            if elapsed_since_flush >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
-                self.logger.info(f"Flushing metrics store (periodic flush every {MetricsProcessor.FLUSH_INTERVAL_SECONDS}s)")
-                try:
-                    self.metrics_store.flush(refresh=False)  # Don't refresh to save time
-                    self.logger.info("Flush completed successfully")
-                    self.last_flush_time = current_time  # Reset timer
-                except Exception as e:
-                    self.logger.error(f"Error during flush: {e}", exc_info=True)
+                self.sample_queue.task_done()
+
+            except queue.Empty:
+                # No samples available, loop back and check shutdown_event
+                continue
+            except Exception as e:
+                self.logger.error(f"Error processing samples in background thread: {e}", exc_info=True)
+
+        self.logger.info("Background processing thread shutting down")
+
+    def _check_and_flush(self):
+        """Check if it's time to flush and flush if needed"""
+        current_time = time.perf_counter()
+        elapsed_since_flush = current_time - self.last_flush_time
+
+        if elapsed_since_flush >= MetricsProcessor.FLUSH_INTERVAL_SECONDS:
+            self.logger.info(f"Time since last flush: {elapsed_since_flush:.1f}s - Flushing now")
+            try:
+                self.metrics_store.flush(refresh=False)  # Don't refresh to save time
+                self.logger.info("Flush completed successfully")
+                self.last_flush_time = current_time  # Reset timer
+            except Exception as e:
+                self.logger.error(f"Error during flush: {e}", exc_info=True)
+        else:
+            self.logger.debug(f"Time since last flush: {elapsed_since_flush:.1f}s/{MetricsProcessor.FLUSH_INTERVAL_SECONDS}s")
 
 class SamplePostprocessor():
     """
