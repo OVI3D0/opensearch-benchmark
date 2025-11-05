@@ -116,19 +116,20 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
                         )
                     profile_metrics_post_processor(profile_samples)
 
-                # Periodically flush this worker's metrics_store
-                current_time = time.perf_counter()
-                if current_time - last_flush_time >= 30:  # Flush every 30 seconds
-                    logger.info(f"Worker {worker_id} flushing after processing {processed_count} samples")
-                    metrics_store.flush(refresh=False)
-                    last_flush_time = current_time
-                    processed_count = 0
-
             except queue_module.Empty:
-                # No samples available, loop back and check shutdown_event
-                continue
+                # No samples available, but still check if we need to flush
+                pass
             except Exception as e:
                 logger.error(f"Error in worker {worker_id}: {e}", exc_info=True)
+
+            # Always check flush time, even if queue was empty
+            # This ensures we flush periodically regardless of sample arrival rate
+            current_time = time.perf_counter()
+            if current_time - last_flush_time >= 30:  # Flush every 30 seconds
+                logger.info(f"Worker {worker_id} flushing after processing {processed_count} samples")
+                metrics_store.flush(refresh=False)
+                last_flush_time = current_time
+                processed_count = 0
 
         # Final flush before shutdown
         print(f"[WORKER {worker_id}] Shutting down", file=sys.stderr, flush=True)
@@ -269,7 +270,9 @@ class MetricsProcessor(actor.BenchmarkActor):
 
         if len(samples) > 0 or len(profile_samples) > 0:
             self.sample_queue.put((samples, profile_samples))
-            self.logger.debug(f"Queued {len(samples)} samples, {len(profile_samples)} profile samples (queue size: {self.sample_queue.qsize()})")
+            self.logger.info(f"Received UpdateSamples: queued {len(samples)} samples, {len(profile_samples)} profile samples (queue size: {self.sample_queue.qsize()})")
+        else:
+            self.logger.debug(f"Received UpdateSamples with 0 samples")
 
         # Update most recent sample per client (thread-safe, only read by this actor)
         for s in samples:
