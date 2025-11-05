@@ -43,18 +43,34 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
     Each worker has its own metrics_store and writes directly to OpenSearch.
     Runs until shutdown_event is set.
     """
-    import logging
-    import queue as queue_module
-    from osbenchmark import metrics
-    from osbenchmark.worker_coordinator.worker_coordinator import load_local_config
-    # Import the classes - they're defined later in this module
-    import osbenchmark.worker_coordinator.metrics_processing as mp_module
+    import sys
+    import traceback
 
-    logger = logging.getLogger(f"{__name__}.worker{worker_id}")
-    logger.info(f"Worker process {worker_id} started (PID: {os.getpid()})")
+    try:
+        # Write to stderr immediately so we can see if worker even starts
+        print(f"[WORKER {worker_id}] Process starting, PID: {os.getpid()}", file=sys.stderr, flush=True)
+
+        import logging
+        import queue as queue_module
+        from osbenchmark import metrics
+        from osbenchmark.worker_coordinator.worker_coordinator import load_local_config
+        # Import the classes - they're defined later in this module
+        import osbenchmark.worker_coordinator.metrics_processing as mp_module
+
+        print(f"[WORKER {worker_id}] Imports successful", file=sys.stderr, flush=True)
+
+        logger = logging.getLogger(f"{__name__}.worker{worker_id}")
+        logger.info(f"Worker process {worker_id} started (PID: {os.getpid()})")
+
+        print(f"[WORKER {worker_id}] Logger configured", file=sys.stderr, flush=True)
+    except Exception as e:
+        print(f"[WORKER {worker_id}] FATAL: Failed during initialization: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        return
 
     try:
         # Create this worker's own metrics_store
+        print(f"[WORKER {worker_id}] Creating config and metrics_store", file=sys.stderr, flush=True)
         config = load_local_config(config_dict)
         metrics_store = metrics.metrics_store(
             cfg=config,
@@ -62,6 +78,7 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
             test_procedure=test_procedure_name,
             read_only=False
         )
+        print(f"[WORKER {worker_id}] Metrics store created", file=sys.stderr, flush=True)
 
         # Create sample post-processor
         sample_post_processor = mp_module.DefaultSamplePostprocessor(
@@ -70,10 +87,14 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
             workload_meta_data,
             test_procedure_meta_data
         )
+        print(f"[WORKER {worker_id}] Sample post-processor created", file=sys.stderr, flush=True)
 
         profile_metrics_post_processor = None
         last_flush_time = time.perf_counter()
         processed_count = 0
+
+        print(f"[WORKER {worker_id}] Entering main loop", file=sys.stderr, flush=True)
+        logger.info(f"Worker {worker_id} fully initialized and ready")
 
         while not shutdown_event.is_set():
             try:
@@ -110,13 +131,22 @@ def _process_worker(worker_id, sample_queue, shutdown_event, config_dict, worklo
                 logger.error(f"Error in worker {worker_id}: {e}", exc_info=True)
 
         # Final flush before shutdown
+        print(f"[WORKER {worker_id}] Shutting down", file=sys.stderr, flush=True)
         logger.info(f"Worker {worker_id} shutting down, final flush")
         metrics_store.flush(refresh=True)
         metrics_store.close()
         logger.info(f"Worker {worker_id} shut down")
+        print(f"[WORKER {worker_id}] Shut down complete", file=sys.stderr, flush=True)
 
     except Exception as e:
-        logger.error(f"Fatal error in worker {worker_id}: {e}", exc_info=True)
+        print(f"[WORKER {worker_id}] FATAL: Exception in main loop: {e}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        try:
+            logger.error(f"Fatal error in worker {worker_id}: {e}", exc_info=True)
+        except:
+            pass  # Logger might not be initialized
+    finally:
+        print(f"[WORKER {worker_id}] Process exiting", file=sys.stderr, flush=True)
 
 
 class MetricsProcessor(actor.BenchmarkActor):
@@ -161,9 +191,12 @@ class MetricsProcessor(actor.BenchmarkActor):
         self.workload_meta_data = msg.workload_meta_data
         self.test_procedure_meta_data = msg.test_procedure_meta_data
 
-        # Create multiprocessing queue and shutdown event
-        self.sample_queue = multiprocessing.Manager().Queue()
-        self.shutdown_event = multiprocessing.Event()
+        # Create multiprocessing manager, queue and shutdown event
+        # IMPORTANT: Both Queue and Event must come from the same Manager instance
+        # to work properly with ProcessPoolExecutor
+        self.manager = multiprocessing.Manager()
+        self.sample_queue = self.manager.Queue()
+        self.shutdown_event = self.manager.Event()
 
         # Create our own metrics_store from config (for flushing tracking only)
         config = load_local_config(msg.config)
@@ -254,6 +287,12 @@ class MetricsProcessor(actor.BenchmarkActor):
             self.logger.info("Shutting down process pool...")
             self.process_pool.shutdown(wait=True, timeout=30)
             self.logger.info("Process pool shut down")
+
+        # Shutdown multiprocessing manager
+        if hasattr(self, 'manager'):
+            self.logger.info("Shutting down multiprocessing manager...")
+            self.manager.shutdown()
+            self.logger.info("Manager shut down")
 
         # Flush any remaining metrics before closing
         if hasattr(self, 'metrics_store') and self.metrics_store:
