@@ -1498,7 +1498,7 @@ class Worker(actor.BenchmarkActor):
     It will also regularly send measurements to the master node so it can consolidate them.
     """
 
-    WAKEUP_INTERVAL_SECONDS = 1
+    WAKEUP_INTERVAL_SECONDS = 5
 
     def __init__(self):
         super().__init__()
@@ -1544,7 +1544,7 @@ class Worker(actor.BenchmarkActor):
             self.logger.info(f"Worker[{msg.worker_id}]: Profiling enabled (profiler.enabled={profiler._profiler.enabled})")
 
         self.on_error = self.config.opts("worker_coordinator", "on.error")
-        self.sample_queue_size = int(self.config.opts("reporting", "sample.queue.size", mandatory=False, default_value=1 << 20))
+        self.sample_queue_size = int(self.config.opts("reporting", "sample.queue.size", mandatory=False, default_value=16384))
         self.workload = msg.workload
         workload.set_absolute_data_path(self.config, self.workload)
         self.client_allocations = msg.client_allocations
