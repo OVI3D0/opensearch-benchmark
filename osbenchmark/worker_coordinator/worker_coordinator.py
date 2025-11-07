@@ -1498,7 +1498,7 @@ class Worker(actor.BenchmarkActor):
     It will also regularly send measurements to the master node so it can consolidate them.
     """
 
-    WAKEUP_INTERVAL_SECONDS = 5
+    WAKEUP_INTERVAL_SECONDS = 1
 
     def __init__(self):
         super().__init__()
