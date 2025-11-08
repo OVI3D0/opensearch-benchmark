@@ -1818,16 +1818,13 @@ class AsyncIoAdapter:
             self.logger.info("Closing %d OpenSearch client(s)", len(opensearch))
             for cluster_name, os_client in opensearch.items():
                 try:
-                    # Close the client session first (releases connection pool, SSL contexts, etc.)
-                    if hasattr(os_client, 'close'):
-                        await os_client.close()
-                        self.logger.debug("Closed OpenSearch client for cluster: %s", cluster_name)
-                    # Also close transport as fallback/additional cleanup
-                    elif hasattr(os_client, 'transport') and hasattr(os_client.transport, 'close'):
-                        await os_client.transport.close()
-                        self.logger.debug("Closed OpenSearch transport for cluster: %s", cluster_name)
+                    # Close the async client properly to release all resources
+                    # (connection pool, SSL contexts, aiohttp sessions, etc.)
+                    self.logger.debug("Closing OpenSearch client for cluster: %s (type: %s)", cluster_name, type(os_client).__name__)
+                    await os_client.close()
+                    self.logger.info("Successfully closed OpenSearch client for cluster: %s", cluster_name)
                 except Exception as e:
-                    self.logger.warning("Error closing OpenSearch client for cluster %s: %s", cluster_name, e)
+                    self.logger.error("Error closing OpenSearch client for cluster %s: %s", cluster_name, e, exc_info=True)
 
             transport_close_end = time.perf_counter()
             self.logger.info("Total time to close OpenSearch clients: %f seconds.", (transport_close_end - shutdown_asyncgens_end))
