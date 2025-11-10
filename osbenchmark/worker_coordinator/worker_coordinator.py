@@ -1752,8 +1752,9 @@ class Worker(actor.BenchmarkActor):
         if self.workload.has_plugins:
             workload.load_workload_plugins(self.config, self.workload.name, runner.register_runner, scheduler.register_scheduler)
 
-        # Start memory profiling if enabled
-        profiling_enabled = self.config.opts("worker_coordinator", "profiling", mandatory=False, default_value=False)
+        # Start memory profiling - enabled by default for leak detection
+        # Note: This is separate from yappi profiling controlled by --enable-worker-coordinator-profiling
+        profiling_enabled = True  # Always enable tracemalloc for memory leak detection
         if profiling_enabled:
             self.logger.info("Worker[%d] starting tracemalloc profiling", msg.worker_id)
             tracemalloc.start()
