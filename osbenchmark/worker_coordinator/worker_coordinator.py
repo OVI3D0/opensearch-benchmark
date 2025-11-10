@@ -52,6 +52,71 @@ from osbenchmark.worker_coordinator import runner, scheduler
 from osbenchmark.workload import WorkloadProcessorRegistry, load_workload, load_workload_plugins, ingestion_manager
 from osbenchmark.utils import convert, console, net
 from osbenchmark.worker_coordinator.errors import parse_error
+
+##################################
+#
+# Memory Profiling Utilities
+#
+##################################
+import tracemalloc
+import linecache
+import gc
+
+def print_memory_snapshot(snapshot, label="Memory Snapshot", key_type='lineno', limit=15):
+    """Print the top memory consumers from a tracemalloc snapshot"""
+    logger = logging.getLogger(__name__)
+    snapshot = snapshot.filter_traces((
+        tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+        tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
+        tracemalloc.Filter(False, "<unknown>"),
+    ))
+    top_stats = snapshot.statistics(key_type)
+
+    logger.info(f"\n{'='*80}")
+    logger.info(f"{label} - Top {limit} memory consumers:")
+    logger.info(f"{'='*80}")
+    for index, stat in enumerate(top_stats[:limit], 1):
+        frame = stat.traceback[0]
+        logger.info(f"#{index}: {frame.filename}:{frame.lineno}: {stat.size / 1024 / 1024:.2f} MiB ({stat.count} blocks)")
+        line = linecache.getline(frame.filename, frame.lineno).strip()
+        if line:
+            logger.info(f"    {line}")
+
+    total_size = sum(stat.size for stat in top_stats) / 1024 / 1024
+    logger.info(f"Total allocated: {total_size:.2f} MiB")
+    logger.info(f"{'='*80}\n")
+
+def print_memory_growth(snapshot1, snapshot2, label="Memory Growth", limit=15):
+    """Print memory growth between two snapshots"""
+    logger = logging.getLogger(__name__)
+    top_stats = snapshot2.compare_to(snapshot1, 'lineno')
+
+    logger.info(f"\n{'='*80}")
+    logger.info(f"{label} - Top {limit} growing allocations:")
+    logger.info(f"{'='*80}")
+    for index, stat in enumerate(top_stats[:limit], 1):
+        if stat.size_diff > 0:
+            frame = stat.traceback[0] if stat.traceback else None
+            if frame:
+                logger.info(f"#{index}: {frame.filename}:{frame.lineno}: +{stat.size_diff / 1024 / 1024:.2f} MiB "
+                          f"({stat.count_diff:+} blocks)")
+                line = linecache.getline(frame.filename, frame.lineno).strip()
+                if line:
+                    logger.info(f"    {line}")
+    logger.info(f"{'='*80}\n")
+
+def get_memory_stats():
+    """Get current memory statistics"""
+    import psutil
+    import os
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    return {
+        'rss_mb': mem_info.rss / 1024 / 1024,
+        'vms_mb': mem_info.vms / 1024 / 1024,
+        'pid': process.pid
+    }
+
 ##################################
 #
 # Messages sent between worker_coordinators
@@ -1657,6 +1722,12 @@ class Worker(actor.BenchmarkActor):
         self.error_queue = None
         self.queue_lock = None
 
+        # Memory profiling
+        self.tracemalloc_enabled = False
+        self.memory_snapshot_baseline = None
+        self.memory_snapshot_count = 0
+        self.wakeup_count = 0
+
     @actor.no_retry("worker")  # pylint: disable=no-value-for-parameter
     def receiveMsg_StartWorker(self, msg, sender):
         self.logger.info("Worker[%d] is about to start.", msg.worker_id)
@@ -1680,6 +1751,20 @@ class Worker(actor.BenchmarkActor):
         runner.register_default_runners()
         if self.workload.has_plugins:
             workload.load_workload_plugins(self.config, self.workload.name, runner.register_runner, scheduler.register_scheduler)
+
+        # Start memory profiling if enabled
+        profiling_enabled = self.config.opts("worker_coordinator", "profiling", mandatory=False, default_value=False)
+        if profiling_enabled:
+            self.logger.info("Worker[%d] starting tracemalloc profiling", msg.worker_id)
+            tracemalloc.start()
+            self.tracemalloc_enabled = True
+            # Take baseline snapshot
+            gc.collect()
+            self.memory_snapshot_baseline = tracemalloc.take_snapshot()
+            mem_stats = get_memory_stats()
+            self.logger.info(f"Worker[{msg.worker_id}] baseline memory: RSS={mem_stats['rss_mb']:.2f} MB, "
+                           f"VMS={mem_stats['vms_mb']:.2f} MB, PID={mem_stats['pid']}")
+
         self.drive()
 
     @actor.no_retry("worker")  # pylint: disable=no-value-for-parameter
@@ -1758,10 +1843,41 @@ class Worker(actor.BenchmarkActor):
                                           str(self.worker_id), most_recent_sample.task)
                 else:
                     self.logger.debug("Worker[%s] is executing (no samples).", str(self.worker_id))
+
+                # Periodic memory profiling
+                if self.tracemalloc_enabled:
+                    self.wakeup_count += 1
+                    # Log memory every 10 wakeups (approximately every 50 seconds with 5s interval)
+                    if self.wakeup_count % 10 == 0:
+                        gc.collect()
+                        current_snapshot = tracemalloc.take_snapshot()
+                        mem_stats = get_memory_stats()
+                        self.logger.info(f"Worker[{self.worker_id}] memory at wakeup #{self.wakeup_count}: "
+                                       f"RSS={mem_stats['rss_mb']:.2f} MB, VMS={mem_stats['vms_mb']:.2f} MB")
+
+                        # Print memory growth since baseline
+                        if self.memory_snapshot_baseline:
+                            print_memory_growth(self.memory_snapshot_baseline, current_snapshot,
+                                              f"Worker[{self.worker_id}] Memory Growth Since Baseline", limit=10)
+
                 self.wakeupAfter(datetime.timedelta(seconds=self.wakeup_interval))
 
     def receiveMsg_ActorExitRequest(self, msg, sender):
         self.logger.info("Worker[%s] has received ActorExitRequest.", str(self.worker_id))
+
+        # Final memory snapshot before exit
+        if self.tracemalloc_enabled:
+            gc.collect()
+            final_snapshot = tracemalloc.take_snapshot()
+            mem_stats = get_memory_stats()
+            self.logger.info(f"Worker[{self.worker_id}] final memory before exit: "
+                           f"RSS={mem_stats['rss_mb']:.2f} MB, VMS={mem_stats['vms_mb']:.2f} MB")
+            print_memory_snapshot(final_snapshot, f"Worker[{self.worker_id}] Final Memory Snapshot", limit=20)
+            if self.memory_snapshot_baseline:
+                print_memory_growth(self.memory_snapshot_baseline, final_snapshot,
+                                  f"Worker[{self.worker_id}] Total Memory Growth", limit=20)
+            tracemalloc.stop()
+
         if self.executor_future is not None and self.executor_future.running():
             self.cancel.set()
         self.pool.shutdown()
@@ -1774,6 +1890,7 @@ class Worker(actor.BenchmarkActor):
     def receiveUnrecognizedMessage(self, msg, sender):
         self.logger.info("Worker[%d] received unknown message [%s] (ignoring).", self.worker_id, str(msg))
 
+    @profile
     def drive(self):
         task_allocations = self.current_tasks_and_advance()
         # skip non-tasks in the task list
@@ -2482,6 +2599,7 @@ class AsyncExecutor:
             except queue.Full:
                 self.logger.warning("Error queue full; dropping error from client %s", self.client_id)
 
+    @profile
     async def __call__(self, *args, **kwargs):
         self.task_completes_parent = self.task.completes_parent
         total_start = time.perf_counter()
