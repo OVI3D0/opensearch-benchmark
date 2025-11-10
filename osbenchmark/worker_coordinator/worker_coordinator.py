@@ -1349,7 +1349,7 @@ class WorkerCoordinator:
         self.progress_publisher.finish()
         if self.metrics_store and self.metrics_store.opened:
             self.metrics_store.close()
-    @profile
+
     def update_samples(self, samples):
         if len(samples) > 0:
             self.raw_samples += samples
@@ -1388,7 +1388,6 @@ class WorkerCoordinator:
             if task_finished:
                 self.progress_publisher.finish()
 
-    @profile
     def post_process_samples(self):
         # we do *not* do this here to avoid concurrent updates (actors are single-threaded) but rather to make it clear that we use
         # only a snapshot and that new data will go to a new sample set.
@@ -1891,7 +1890,6 @@ class Worker(actor.BenchmarkActor):
     def receiveUnrecognizedMessage(self, msg, sender):
         self.logger.info("Worker[%d] received unknown message [%s] (ignoring).", self.worker_id, str(msg))
 
-    @profile
     def drive(self):
         task_allocations = self.current_tasks_and_advance()
         # skip non-tasks in the task list
@@ -1935,7 +1933,6 @@ class Worker(actor.BenchmarkActor):
         self.logger.debug("Worker[%d] is at task index [%d].", self.worker_id, self.current_task_index)
         return current
 
-    @profile
     def send_samples(self):
         if self.sampler:
             samples = self.sampler.samples
@@ -2271,7 +2268,6 @@ class AsyncIoAdapter:
     def _logging_exception_handler(self, loop, context):
         self.logger.error("Uncaught exception in event loop: %s", context)
 
-    @profile
     async def run(self):
         def os_clients(all_hosts, all_client_options):
             opensearch = {}
@@ -2438,7 +2434,7 @@ class AsyncExecutor:
                                                     default_value=multiprocessing.cpu_count()))
                 params.update({"num_clients": self.task.clients, "num_cores": available_cores})
             return context_manager
-    @profile
+
     async def _execute_request(self, params: dict, expected_scheduled_time: float, total_start: float,
                                client_state: bool) -> dict:
         """Execute a request with timing control and error handling."""
@@ -2520,7 +2516,7 @@ class AsyncExecutor:
             "request_meta_data": request_meta_data,
             "throughput_throttled": throughput_throttled
         }
-    @profile
+
     def _process_results(self, result_data: dict, total_start: float, client_state: bool,
                          task_progress: tuple, add_profile_metric_sample: bool = False) -> bool:
         """Process results from a request."""
@@ -2600,7 +2596,6 @@ class AsyncExecutor:
             except queue.Full:
                 self.logger.warning("Error queue full; dropping error from client %s", self.client_id)
 
-    @profile
     async def __call__(self, *args, **kwargs):
         self.task_completes_parent = self.task.completes_parent
         total_start = time.perf_counter()
@@ -2656,7 +2651,6 @@ class AsyncExecutor:
 
 request_context_holder = client.RequestContextHolder()
 
-@profile
 async def execute_single(runner, opensearch, params, on_error, redline_enabled=False, client_enabled=True):
     """
     Invokes the given runner once and provides the runner's return value in a uniform structure.
