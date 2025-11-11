@@ -7823,3 +7823,202 @@ class ProduceStreamMessageTests(TestCase):
             await self.runner_instance(mock_opensearch, params)
 
         self.assertIn("Failed to produce message", str(context.exception))
+
+
+class BulkVectorDataSetTests(TestCase):
+    @mock.patch('osbenchmark.client.RequestContextHolder.on_client_request_end')
+    @mock.patch('osbenchmark.client.RequestContextHolder.on_client_request_start')
+    @mock.patch("opensearchpy.OpenSearch")
+    @run_async
+    async def test_bulk_vector_simple_stats_success(self, opensearch, on_client_request_start, on_client_request_end):
+        bulk_response = {
+            "took": 10,
+            "errors": False,
+            "items": [
+                {
+                    "index": {
+                        "status": 201,
+                        "_shards": {
+                            "total": 2,
+                            "successful": 2,
+                            "failed": 0
+                        }
+                    }
+                },
+                {
+                    "index": {
+                        "status": 201,
+                        "_shards": {
+                            "total": 2,
+                            "successful": 2,
+                            "failed": 0
+                        }
+                    }
+                }
+            ]
+        }
+
+        opensearch.bulk.return_value = as_future(io.StringIO(json.dumps(bulk_response)))
+
+        bulk_vector = runner.BulkVectorDataSet()
+
+        params = {
+            "body": [
+                {"index": {"_index": "test"}},
+                {"vector_field": [0.1, 0.2, 0.3]},
+                {"index": {"_index": "test"}},
+                {"vector_field": [0.4, 0.5, 0.6]}
+            ],
+            "size": 2,
+            "retries": 0
+        }
+
+        result = await bulk_vector(opensearch, params)
+
+        self.assertEqual(2, result["weight"])
+        self.assertEqual("docs", result["unit"])
+        self.assertTrue(result["success"])
+        self.assertEqual(2, result["success-count"])
+        self.assertEqual(0, result["error-count"])
+        self.assertEqual(10, result["took"])
+
+    @mock.patch('osbenchmark.client.RequestContextHolder.on_client_request_end')
+    @mock.patch('osbenchmark.client.RequestContextHolder.on_client_request_start')
+    @mock.patch("opensearchpy.OpenSearch")
+    @run_async
+    async def test_bulk_vector_simple_stats_with_errors(self, opensearch, on_client_request_start, on_client_request_end):
+        bulk_response = {
+            "took": 15,
+            "errors": True,
+            "items": [
+                {
+                    "index": {
+                        "status": 201,
+                        "_shards": {
+                            "total": 2,
+                            "successful": 2,
+                            "failed": 0
+                        }
+                    }
+                },
+                {
+                    "index": {
+                        "status": 400,
+                        "error": {
+                            "type": "mapper_parsing_exception",
+                            "reason": "failed to parse field [vector_field]"
+                        },
+                        "_shards": {
+                            "total": 2,
+                            "successful": 0,
+                            "failed": 2
+                        }
+                    }
+                },
+                {
+                    "index": {
+                        "status": 201,
+                        "_shards": {
+                            "total": 2,
+                            "successful": 2,
+                            "failed": 0
+                        }
+                    }
+                }
+            ]
+        }
+
+        opensearch.bulk.return_value = as_future(io.StringIO(json.dumps(bulk_response)))
+
+        bulk_vector = runner.BulkVectorDataSet()
+
+        params = {
+            "body": [
+                {"index": {"_index": "test"}},
+                {"vector_field": [0.1, 0.2, 0.3]},
+                {"index": {"_index": "test"}},
+                {"vector_field": "invalid"},
+                {"index": {"_index": "test"}},
+                {"vector_field": [0.7, 0.8, 0.9]}
+            ],
+            "size": 3,
+            "retries": 0
+        }
+
+        result = await bulk_vector(opensearch, params)
+
+        self.assertEqual(3, result["weight"])
+        self.assertEqual("docs", result["unit"])
+        self.assertFalse(result["success"])
+        self.assertEqual(2, result["success-count"])
+        self.assertEqual(1, result["error-count"])
+        self.assertEqual("bulk", result["error-type"])
+        self.assertIn("400", result["error-description"])
+        self.assertEqual(15, result["took"])
+
+    @mock.patch('osbenchmark.client.RequestContextHolder.on_client_request_end')
+    @mock.patch('osbenchmark.client.RequestContextHolder.on_client_request_start')
+    @mock.patch("opensearchpy.OpenSearch")
+    @run_async
+    async def test_bulk_vector_detailed_stats_with_errors(self, opensearch, on_client_request_start, on_client_request_end):
+        bulk_response = {
+            "took": 20,
+            "errors": True,
+            "items": [
+                {
+                    "index": {
+                        "status": 201,
+                        "result": "created",
+                        "_shards": {
+                            "total": 2,
+                            "successful": 2,
+                            "failed": 0
+                        }
+                    }
+                },
+                {
+                    "index": {
+                        "status": 429,
+                        "error": {
+                            "type": "es_rejected_execution_exception",
+                            "reason": "rejected execution"
+                        },
+                        "_shards": {
+                            "total": 2,
+                            "successful": 0,
+                            "failed": 2
+                        }
+                    }
+                }
+            ]
+        }
+
+        opensearch.bulk.return_value = as_future(bulk_response)
+
+        bulk_vector = runner.BulkVectorDataSet()
+
+        params = {
+            "body": [
+                {"index": {"_index": "test"}},
+                {"vector_field": [0.1, 0.2, 0.3]},
+                {"index": {"_index": "test"}},
+                {"vector_field": [0.4, 0.5, 0.6]}
+            ],
+            "size": 2,
+            "retries": 0,
+            "detailed-results": True
+        }
+
+        result = await bulk_vector(opensearch, params)
+
+        self.assertEqual(2, result["weight"])
+        self.assertEqual("docs", result["unit"])
+        self.assertFalse(result["success"])
+        self.assertEqual(1, result["success-count"])
+        self.assertEqual(1, result["error-count"])
+        self.assertEqual("bulk", result["error-type"])
+        self.assertIn("429", result["error-description"])
+        self.assertEqual(20, result["took"])
+        # Detailed stats should include ops and shards_histogram
+        self.assertIn("ops", result)
+        self.assertIn("shards_histogram", result)
