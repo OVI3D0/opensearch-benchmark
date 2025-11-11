@@ -1021,6 +1021,12 @@ class WorkerCoordinator:
 
         self.telemetry = None
 
+        # Memory profiling for coordinator
+        self.tracemalloc_enabled = False
+        self.memory_snapshot_baseline = None
+        self.memory_snapshot_count = 0
+        self.sample_processing_count = 0
+
     def create_os_clients(self):
         all_hosts = self.config.opts("client", "hosts").all_hosts
         opensearch = {}
@@ -1135,6 +1141,17 @@ class WorkerCoordinator:
 
     def start_benchmark(self):
         self.logger.info("OSB is about to start.")
+
+        # Start memory profiling for coordinator - always enabled for leak detection
+        self.logger.info("WorkerCoordinator starting tracemalloc profiling")
+        tracemalloc.start()
+        self.tracemalloc_enabled = True
+        gc.collect()
+        self.memory_snapshot_baseline = tracemalloc.take_snapshot()
+        mem_stats = get_memory_stats()
+        self.logger.info(f"WorkerCoordinator baseline memory: RSS={mem_stats['rss_mb']:.2f} MB, "
+                       f"VMS={mem_stats['vms_mb']:.2f} MB, PID={mem_stats['pid']}")
+
         # ensure relative time starts when the benchmark starts.
         self.reset_relative_time()
         self.logger.info("Attaching cluster-level telemetry devices.")
@@ -1347,15 +1364,51 @@ class WorkerCoordinator:
 
     def close(self):
         self.progress_publisher.finish()
+
+        # Final memory snapshot for coordinator
+        if self.tracemalloc_enabled:
+            gc.collect()
+            final_snapshot = tracemalloc.take_snapshot()
+            mem_stats = get_memory_stats()
+            self.logger.info(f"WorkerCoordinator final memory before close: "
+                           f"RSS={mem_stats['rss_mb']:.2f} MB, VMS={mem_stats['vms_mb']:.2f} MB")
+
+            # Check final data structure sizes
+            self.logger.info(f"WorkerCoordinator final state: "
+                           f"{len(self.raw_samples)} raw_samples, "
+                           f"{len(self.raw_profile_samples)} raw_profile_samples, "
+                           f"{len(self.most_recent_sample_per_client)} tracked clients")
+
+            if hasattr(self.sample_post_processor, 'throughput_calculator'):
+                calc = self.sample_post_processor.throughput_calculator
+                total_unprocessed = sum(len(stats.unprocessed) for stats in calc.task_stats.values())
+                self.logger.info(f"WorkerCoordinator ThroughputCalculator final state: "
+                               f"{total_unprocessed} unprocessed samples across {len(calc.task_stats)} tasks")
+                for task, stats in calc.task_stats.items():
+                    if len(stats.unprocessed) > 0:
+                        self.logger.info(f"  Task {task.name}: {len(stats.unprocessed)} unprocessed samples")
+
+            print_memory_snapshot(final_snapshot, f"WorkerCoordinator Final Memory Snapshot", limit=20)
+            if self.memory_snapshot_baseline:
+                print_memory_growth(self.memory_snapshot_baseline, final_snapshot,
+                                  f"WorkerCoordinator Total Memory Growth", limit=20)
+            tracemalloc.stop()
+
         if self.metrics_store and self.metrics_store.opened:
             self.metrics_store.close()
 
+    @profile
     def update_samples(self, samples):
         if len(samples) > 0:
             self.raw_samples += samples
             # We need to check all samples, they will be from different clients
             for s in samples:
                 self.most_recent_sample_per_client[s.client_id] = s
+
+            # Log if raw_samples is growing excessively
+            if len(self.raw_samples) > 10000:
+                self.logger.warning(f"WorkerCoordinator.raw_samples has grown to {len(self.raw_samples)} samples! "
+                                  f"Received {len(samples)} new samples. Post-processing may be lagging.")
 
     def update_profile_samples(self, profile_samples):
         if len(profile_samples) > 0:
@@ -1388,11 +1441,40 @@ class WorkerCoordinator:
             if task_finished:
                 self.progress_publisher.finish()
 
+    @profile
     def post_process_samples(self):
         # we do *not* do this here to avoid concurrent updates (actors are single-threaded) but rather to make it clear that we use
         # only a snapshot and that new data will go to a new sample set.
         raw_samples = self.raw_samples
         self.raw_samples = []
+
+        # Track sample accumulation for leak detection
+        self.sample_processing_count += 1
+        if self.tracemalloc_enabled and self.sample_processing_count % 10 == 0:
+            self.logger.info(f"WorkerCoordinator processing samples batch #{self.sample_processing_count}: "
+                           f"{len(raw_samples)} raw samples, {len(self.raw_samples)} remaining in queue, "
+                           f"{len(self.most_recent_sample_per_client)} tracked clients")
+
+            # Check for unprocessed sample accumulation in ThroughputCalculator
+            if hasattr(self.sample_post_processor, 'throughput_calculator'):
+                calc = self.sample_post_processor.throughput_calculator
+                total_unprocessed = sum(len(stats.unprocessed) for stats in calc.task_stats.values())
+                if total_unprocessed > 0:
+                    self.logger.warning(f"WorkerCoordinator ThroughputCalculator has {total_unprocessed} unprocessed samples across {len(calc.task_stats)} tasks")
+                    for task, stats in calc.task_stats.items():
+                        if len(stats.unprocessed) > 100:
+                            self.logger.warning(f"  Task {task.name}: {len(stats.unprocessed)} unprocessed samples (bucket={stats.bucket}, interval={stats.interval})")
+
+            gc.collect()
+            current_snapshot = tracemalloc.take_snapshot()
+            mem_stats = get_memory_stats()
+            self.logger.info(f"WorkerCoordinator memory after processing batch #{self.sample_processing_count}: "
+                           f"RSS={mem_stats['rss_mb']:.2f} MB, VMS={mem_stats['vms_mb']:.2f} MB")
+
+            if self.memory_snapshot_baseline:
+                print_memory_growth(self.memory_snapshot_baseline, current_snapshot,
+                                  f"WorkerCoordinator Memory Growth Since Baseline", limit=10)
+
         self.sample_post_processor(raw_samples)
         profile_samples = self.raw_profile_samples
         self.raw_profile_samples = []
@@ -1937,6 +2019,10 @@ class Worker(actor.BenchmarkActor):
         if self.sampler:
             samples = self.sampler.samples
             if len(samples) > 0:
+                # Log if sending unusually large batches
+                if len(samples) > 1000:
+                    self.logger.warning(f"Worker[{self.worker_id}] sending large sample batch: "
+                                      f"{len(samples)} samples, queue size: {self.sampler.q.qsize()}")
                 self.send(self.master, UpdateSamples(self.worker_id, samples, self.profile_sampler.samples))
             return samples
         return None
