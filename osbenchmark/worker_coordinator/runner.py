@@ -1692,8 +1692,7 @@ class PplQuery(Runner):
 
         return {
             "rows": normalized_rows,
-            "meta": meta,
-            "raw": response
+            "meta": meta
         }
 
     def __repr__(self, *args, **kwargs):
