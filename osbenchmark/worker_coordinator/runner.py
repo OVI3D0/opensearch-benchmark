@@ -62,6 +62,7 @@ def register_default_runners():
     register_runner(workload.OperationType.IndexStats, Retry(IndicesStats()), async_runner=True)
     register_runner(workload.OperationType.NodeStats, NodeStats(), async_runner=True)
     register_runner(workload.OperationType.Search, Query(), async_runner=True)
+    register_runner(workload.OperationType.PplQuery, PplQuery(), async_runner=True)
     register_runner(workload.OperationType.PaginatedSearch, Query(), async_runner=True)
     register_runner(workload.OperationType.ScrollSearch, Query(), async_runner=True)
     register_runner(workload.OperationType.VectorSearch, Query(), async_runner=True)
@@ -396,13 +397,33 @@ class AssertingRunner(Runner, Delegator):
     def equal(self, expected, actual):
         return actual == expected
 
+    def _resolve_property_path(self, properties, path, op_name):
+        actual_value = properties
+        for k in path.split("."):
+            if isinstance(actual_value, list):
+                try:
+                    index = int(k)
+                except ValueError as exc:
+                    msg = f"Expected numeric index while resolving path [{path}] at component [{k}] in [{op_name}]."
+                    raise exceptions.BenchmarkTaskAssertionError(msg) from exc
+                try:
+                    actual_value = actual_value[index]
+                except IndexError as exc:
+                    msg = f"Index [{index}] out of range while resolving path [{path}] in [{op_name}]."
+                    raise exceptions.BenchmarkTaskAssertionError(msg) from exc
+            else:
+                try:
+                    actual_value = actual_value[k]
+                except (TypeError, KeyError) as exc:
+                    msg = f"Unable to resolve path component [{k}] while resolving [{path}] in [{op_name}]."
+                    raise exceptions.BenchmarkTaskAssertionError(msg) from exc
+        return actual_value
+
     def check_assertion(self, op_name, assertion, properties):
         path = assertion["property"]
         predicate_name = assertion["condition"]
         expected_value = assertion["value"]
-        actual_value = properties
-        for k in path.split("."):
-            actual_value = actual_value[k]
+        actual_value = self._resolve_property_path(properties, path, op_name or "<unnamed>")
         predicate = self.predicates[predicate_name]
         success = predicate(expected_value, actual_value)
         if not success:
@@ -1615,6 +1636,68 @@ class Query(Runner):
 
     def __repr__(self, *args, **kwargs):
         return "query"
+
+
+class PplQuery(Runner):
+    """
+    Executes a PPL request via the SQL plugin and normalizes the response for assertions.
+    """
+
+    @staticmethod
+    def _normalize_rows(response):
+        if not isinstance(response, dict):
+            return response
+        rows = response.get("datarows")
+        schema = response.get("schema")
+        if isinstance(schema, list) and isinstance(rows, list):
+            field_names = [col.get("name") for col in schema]
+            normalized = []
+            for row in rows:
+                if isinstance(row, list) and len(row) == len(field_names):
+                    normalized.append(dict(zip(field_names, row)))
+                else:
+                    normalized.append(row)
+            return normalized
+        return rows
+
+    async def __call__(self, opensearch, params):
+        request_params, headers = self._transport_request_params(params)
+        body = mandatory(params, "body", self)
+        path = params.get("path", "/_plugins/_ppl")
+        method = params.get("method", "POST")
+
+        if not path.startswith("/"):
+            self.logger.error("PplQuery failed. Path parameter: [%s] must begin with a '/'.", path)
+            raise exceptions.BenchmarkAssertionError(f"PplQuery [{path}] failed. Path parameter must begin with a '/'.")
+
+        if not bool(headers):
+            # preserve historical raw-request behavior
+            headers = None
+
+        request_context_holder.on_client_request_start()
+        response = await opensearch.transport.perform_request(
+            method=method,
+            url=path,
+            headers=headers,
+            body=body,
+            params=request_params
+        )
+        request_context_holder.on_client_request_end()
+
+        normalized_rows = self._normalize_rows(response if isinstance(response, dict) else {})
+        meta_keys = ("schema", "total", "size", "status")
+        meta = {}
+        if isinstance(response, dict):
+            meta = {k: response[k] for k in meta_keys if k in response}
+
+        return {
+            "rows": normalized_rows,
+            "meta": meta,
+            "raw": response
+        }
+
+    def __repr__(self, *args, **kwargs):
+        return "ppl-query"
 
 
 class SearchAfterExtractor:

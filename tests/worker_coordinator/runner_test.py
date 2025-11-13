@@ -258,6 +258,54 @@ class AssertingRunnerTests(TestCase):
             self.assertTrue(r.predicates[predicate](expected, actual),
                             f"Expected [{expected} {predicate} {actual}] to succeed.")
 
+    @run_async
+    async def test_asserts_can_address_list_entries(self):
+        opensearch = None
+        response = {
+            "rows": [
+                {"total_docs": 3}
+            ]
+        }
+        delegate = mock.MagicMock()
+        delegate.return_value = as_future(response)
+        r = runner.AssertingRunner(delegate)
+        async with r:
+            await r(opensearch, {
+                "name": "ppl-q01",
+                "assertions": [
+                    {
+                        "property": "rows.0.total_docs",
+                        "condition": "==",
+                        "value": 3
+                    }
+                ]
+            })
+
+    @run_async
+    async def test_asserts_fail_on_non_numeric_list_segment(self):
+        opensearch = None
+        response = {
+            "rows": [
+                {"total_docs": 3}
+            ]
+        }
+        delegate = mock.MagicMock()
+        delegate.return_value = as_future(response)
+        r = runner.AssertingRunner(delegate)
+        with self.assertRaisesRegex(exceptions.BenchmarkTaskAssertionError,
+                                    r"numeric index while resolving path \[rows.foo.total_docs\]"):
+            async with r:
+                await r(opensearch, {
+                    "name": "ppl-q01",
+                    "assertions": [
+                        {
+                            "property": "rows.foo.total_docs",
+                            "condition": "==",
+                            "value": 3
+                        }
+                    ]
+                })
+
         predicate_fail = {
             # predicate: (expected, actual)
             ">": (5, 5),

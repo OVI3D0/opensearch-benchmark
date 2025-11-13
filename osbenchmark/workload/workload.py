@@ -603,6 +603,7 @@ class OperationType(Enum):
     IndexStats = (1, AdminStatus.No, ServerlessStatus.Blocked)
     NodeStats = (2, AdminStatus.No, ServerlessStatus.Blocked)
     Search = (3, AdminStatus.No, ServerlessStatus.Public)
+    PplQuery = (301, AdminStatus.No, ServerlessStatus.Public)
     Bulk = (4, AdminStatus.No, ServerlessStatus.Public)
     RawRequest = (5, AdminStatus.No, ServerlessStatus.Public)
     WaitForRecovery = (6, AdminStatus.No, ServerlessStatus.Blocked)
@@ -690,6 +691,8 @@ class OperationType(Enum):
             return OperationType.NodeStats
         elif v == "search":
             return OperationType.Search
+        elif v == "ppl-query":
+            return OperationType.PplQuery
         elif v == "proto-search":
             return OperationType.ProtoSearch
         elif v == "scroll-search":
