@@ -1644,6 +1644,7 @@ class PplQuery(Runner):
     Executes a PPL request via the SQL plugin and normalizes the response for assertions.
     """
     LOG_PATH = Path("ppl_query_responses.log")
+    QUERY_NUMBER = 1
     @staticmethod
     def _normalize_rows(response):
         if not isinstance(response, dict):
@@ -1699,8 +1700,10 @@ class PplQuery(Runner):
 
     def _append_response(self, payload):
         with self.LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(f"QUERY {self.QUERY_NUMBER}:\n")
             fh.write(json.dumps(payload, ensure_ascii=False))
             fh.write("\n")
+        self.QUERY_NUMBER += 1
 
     def __repr__(self, *args, **kwargs):
         return "ppl-query"
