@@ -39,6 +39,7 @@ from io import BytesIO
 from os.path import commonprefix
 import multiprocessing
 from typing import Any, Dict, List, Optional
+from pathlib import Path
 
 import ijson
 
@@ -1642,7 +1643,7 @@ class PplQuery(Runner):
     """
     Executes a PPL request via the SQL plugin and normalizes the response for assertions.
     """
-
+    LOG_PATH = Path("ppl_query_responses.log")
     @staticmethod
     def _normalize_rows(response):
         if not isinstance(response, dict):
@@ -1690,10 +1691,16 @@ class PplQuery(Runner):
         if isinstance(response, dict):
             meta = {k: response[k] for k in meta_keys if k in response}
 
+        self._append_response(response)
         return {
             "rows": normalized_rows,
             "meta": meta
         }
+
+    def _append_response(self, payload):
+        with self.LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False))
+            fh.write("\n")
 
     def __repr__(self, *args, **kwargs):
         return "ppl-query"
