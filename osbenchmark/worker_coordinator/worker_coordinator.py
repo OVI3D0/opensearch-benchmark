@@ -1558,23 +1558,53 @@ def log_memory_usage(location):
     display_top(snapshot, location)
 
 def display_top(snapshot, location, key_type='lineno', limit=10):
+    logger = logging.getLogger(__name__)
     top_stats = snapshot.statistics(key_type)
+    divider = "=" * 80
+    header = f"Top {limit} lines at {location}"
+    log_lines = ["", divider, header]
 
-    print("Top %s lines at %s" % (limit, location))
+    logger.info(divider)
+    logger.info(header)
     for index, stat in enumerate(top_stats[:limit], 1):
         frame = stat.traceback[0]
-        print("#%s: %s:%s: %.1f KiB"
-              % (index, frame.filename, frame.lineno, stat.size / 1024))
+        entry = f"#{index}: {frame.filename}:{frame.lineno}: {stat.size / 1024:.1f} KiB ({stat.count} blocks)"
+        logger.info(entry)
+        log_lines.append(entry)
         line = linecache.getline(frame.filename, frame.lineno).strip()
         if line:
-            print('    %s' % line)
+            detail = f"    {line}"
+            logger.info(detail)
+            log_lines.append(detail)
 
     other = top_stats[limit:]
     if other:
         size = sum(stat.size for stat in other)
-        print("%s other: %.1f KiB" % (len(other), size / 1024))
+        summary = f"{len(other)} other: {size / 1024:.1f} KiB"
+        logger.info(summary)
+        log_lines.append(summary)
     total = sum(stat.size for stat in top_stats)
-    print("Total allocated size: %.1f KiB" % (total / 1024))
+    total_line = f"Total allocated size: {total / 1024:.1f} KiB"
+    logger.info(total_line)
+    logger.info(divider)
+    log_lines.extend([total_line, divider])
+    _persist_memory_snapshot(location, log_lines)
+
+
+def _persist_memory_snapshot(location, log_lines):
+    logger = logging.getLogger(__name__)
+    try:
+        log_dir = paths.logs()
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "memory_snapshots.log")
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            timestamp = datetime.datetime.utcnow().isoformat()
+            log_file.write(f"[{timestamp}] {location} (pid={os.getpid()})\n")
+            for line in log_lines:
+                log_file.write(f"{line}\n")
+            log_file.write("\n")
+    except Exception:
+        logger.exception("Failed to persist memory snapshot to disk.")
 
 def calculate_worker_assignments(host_configs, client_count):
     """
