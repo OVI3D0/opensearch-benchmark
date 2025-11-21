@@ -55,6 +55,8 @@ from osbenchmark.worker_coordinator import runner, scheduler
 from osbenchmark.workload import WorkloadProcessorRegistry, load_workload, load_workload_plugins, ingestion_manager
 from osbenchmark.utils import convert, console, net
 from osbenchmark.worker_coordinator.errors import parse_error
+
+MEMORY_SNAPSHOT_SUMMARY = {}
 ##################################
 #
 # Messages sent between worker_coordinators
@@ -1557,54 +1559,101 @@ def log_memory_usage(location):
     snapshot = tracemalloc.take_snapshot()
     display_top(snapshot, location)
 
+
 def display_top(snapshot, location, key_type='lineno', limit=10):
     logger = logging.getLogger(__name__)
     top_stats = snapshot.statistics(key_type)
     divider = "=" * 80
     header = f"Top {limit} lines at {location}"
-    log_lines = ["", divider, header]
-
     logger.info(divider)
     logger.info(header)
+    summary_entries = []
+
     for index, stat in enumerate(top_stats[:limit], 1):
         frame = stat.traceback[0]
         entry = f"#{index}: {frame.filename}:{frame.lineno}: {stat.size / 1024:.1f} KiB ({stat.count} blocks)"
         logger.info(entry)
-        log_lines.append(entry)
-        line = linecache.getline(frame.filename, frame.lineno).strip()
-        if line:
-            detail = f"    {line}"
-            logger.info(detail)
-            log_lines.append(detail)
+        code_line = linecache.getline(frame.filename, frame.lineno).strip()
+        if code_line:
+            logger.info("    %s", code_line)
+        summary_entries.append(
+            {
+                "filename": frame.filename,
+                "lineno": frame.lineno,
+                "function": frame.name,
+                "size": stat.size,
+                "context": location,
+                "code_line": code_line,
+            }
+        )
 
     other = top_stats[limit:]
     if other:
         size = sum(stat.size for stat in other)
-        summary = f"{len(other)} other: {size / 1024:.1f} KiB"
-        logger.info(summary)
-        log_lines.append(summary)
+        logger.info("%s other: %.1f KiB", len(other), size / 1024)
     total = sum(stat.size for stat in top_stats)
-    total_line = f"Total allocated size: {total / 1024:.1f} KiB"
-    logger.info(total_line)
+    logger.info("Total allocated size: %.1f KiB", total / 1024)
     logger.info(divider)
-    log_lines.extend([total_line, divider])
-    _persist_memory_snapshot(location, log_lines)
+    _update_memory_summary(summary_entries)
 
 
-def _persist_memory_snapshot(location, log_lines):
+def _update_memory_summary(entries):
+    if not entries:
+        return
+
+    for entry in entries:
+        key = (entry["filename"], entry["lineno"], entry["function"])
+        summary = MEMORY_SNAPSHOT_SUMMARY.get(key)
+        if summary is None:
+            summary = {
+                "count": 0,
+                "total": 0.0,
+                "min": entry["size"],
+                "max": entry["size"],
+                "code_line": entry["code_line"],
+                "contexts": set(),
+            }
+        summary["count"] += 1
+        summary["total"] += entry["size"]
+        summary["min"] = min(summary["min"], entry["size"])
+        summary["max"] = max(summary["max"], entry["size"])
+        if entry["code_line"]:
+            summary["code_line"] = entry["code_line"]
+        summary["contexts"].add(entry["context"])
+        MEMORY_SNAPSHOT_SUMMARY[key] = summary
+
+    _write_memory_summary()
+
+
+def _write_memory_summary():
+    if not MEMORY_SNAPSHOT_SUMMARY:
+        return
+
     logger = logging.getLogger(__name__)
     try:
         log_dir = paths.logs()
         os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, "memory_snapshots.log")
-        with open(log_path, "a", encoding="utf-8") as log_file:
-            timestamp = datetime.datetime.utcnow().isoformat()
-            log_file.write(f"[{timestamp}] {location} (pid={os.getpid()})\n")
-            for line in log_lines:
-                log_file.write(f"{line}\n")
-            log_file.write("\n")
+        log_path = os.path.join(log_dir, "memory_snapshot_summary.log")
+        with open(log_path, "w", encoding="utf-8") as log_file:
+            log_file.write("location|function|count|avg_mib|max_mib|min_mib|contexts|code\n")
+            items = sorted(
+                MEMORY_SNAPSHOT_SUMMARY.items(),
+                key=lambda item: (item[1]["total"] / item[1]["count"]),
+                reverse=True
+            )
+            for (filename, lineno, function), stats in items:
+                avg_mib = (stats["total"] / stats["count"]) / (1024 * 1024)
+                max_mib = stats["max"] / (1024 * 1024)
+                min_mib = stats["min"] / (1024 * 1024)
+                location = f"{filename}:{lineno}"
+                contexts = ",".join(sorted(stats["contexts"]))
+                code_line = stats.get("code_line", "")
+                log_file.write(
+                    f"{location}|{function}|{stats['count']}|{avg_mib:.4f}|{max_mib:.4f}|{min_mib:.4f}|{contexts}|{code_line}\n"
+                )
     except Exception:
-        logger.exception("Failed to persist memory snapshot to disk.")
+        logger.exception("Failed to persist memory snapshot summary to disk.")
+
 
 def calculate_worker_assignments(host_configs, client_count):
     """
