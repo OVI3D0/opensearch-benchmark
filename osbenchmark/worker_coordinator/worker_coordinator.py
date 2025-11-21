@@ -1562,6 +1562,11 @@ def log_memory_usage(location):
 
 def display_top(snapshot, location, key_type='lineno', limit=10):
     logger = logging.getLogger(__name__)
+    snapshot = snapshot.filter_traces((
+        tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+        tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
+        tracemalloc.Filter(False, "<unknown>"),
+    ))
     top_stats = snapshot.statistics(key_type)
     divider = "=" * 80
     header = f"Top {limit} lines at {location}"
@@ -1571,18 +1576,17 @@ def display_top(snapshot, location, key_type='lineno', limit=10):
 
     for index, stat in enumerate(top_stats[:limit], 1):
         frame = stat.traceback[0]
+        frame_name = getattr(frame, "name", "<unknown>")
         entry = f"#{index}: {frame.filename}:{frame.lineno}: {stat.size / 1024:.1f} KiB ({stat.count} blocks)"
         logger.info(entry)
         code_line = linecache.getline(frame.filename, frame.lineno).strip()
         if code_line:
             logger.info("    %s", code_line)
-        print("frame:", frame)
-        print("frame info: ", dir(frame))
         summary_entries.append(
             {
                 "filename": frame.filename,
                 "lineno": frame.lineno,
-                "function": frame.name,
+                "function": frame_name,
                 "size": stat.size,
                 "context": location,
                 "code_line": code_line,
