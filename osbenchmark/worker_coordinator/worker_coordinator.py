@@ -1576,7 +1576,8 @@ def display_top(snapshot, location, key_type='lineno', limit=10):
         code_line = linecache.getline(frame.filename, frame.lineno).strip()
         if code_line:
             logger.info("    %s", code_line)
-        print(frame)
+        print("frame:", frame)
+        print("frame info: ", dir(frame))
         summary_entries.append(
             {
                 "filename": frame.filename,
