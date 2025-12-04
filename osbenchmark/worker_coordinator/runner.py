@@ -1692,7 +1692,7 @@ class PplQuery(Runner):
         if isinstance(response, dict):
             meta = {k: response[k] for k in meta_keys if k in response}
 
-        self._append_response(response)
+        # self._append_response(response)
         return {
             "rows": normalized_rows,
             "meta": meta
