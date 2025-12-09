@@ -160,26 +160,22 @@ def reset_assertion_failures():
 def print_assertion_summary():
     """
     Prints a summary of all assertion failures to the console.
-    Only prints if assertions were enabled for this benchmark run.
+    Prints assertion failures as they are encountered during the benchmark run.
     """
-    # Only print if assertions were enabled
-    if not AssertingRunner.assertions_enabled:
+    # If there were no failures tracked, nothing to report
+    # (This handles both the case where assertions were disabled and where all assertions passed)
+    if AssertingRunner.assertion_failure_count == 0:
         return
 
     failure_count = AssertingRunner.assertion_failure_count
     failures = AssertingRunner.assertion_failures
 
-    if failure_count == 0:
-        print("\n" + "="*80)
-        print("ASSERTION SUMMARY: All assertions passed!")
-        print("="*80)
-    else:
-        print("\n" + "="*80)
-        print(f"ASSERTION SUMMARY: {failure_count} assertion(s) failed")
-        print("="*80)
-        for i, failure_msg in enumerate(failures, 1):
-            print(f"{i}. {failure_msg}")
-        print("="*80)
+    print("\n" + "="*80)
+    print(f"ASSERTION SUMMARY: {failure_count} assertion(s) failed")
+    print("="*80)
+    for i, failure_msg in enumerate(failures, 1):
+        print(f"{i}. {failure_msg}")
+    print("="*80)
 
 
 def register_runner(operation_type, runner, **kwargs):
