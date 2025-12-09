@@ -139,6 +139,44 @@ def enable_assertions(enabled):
     AssertingRunner.assertions_enabled = enabled
 
 
+def get_assertion_failures():
+    """
+    Returns a tuple of (failure_count, failure_messages).
+
+    :return: Tuple of (int, list) containing the count and list of failure messages.
+    """
+    return (AssertingRunner.assertion_failure_count, AssertingRunner.assertion_failures.copy())
+
+
+def reset_assertion_failures():
+    """
+    Resets the assertion failure counter and clears the failure list.
+    Should be called at the beginning of a new benchmark run.
+    """
+    AssertingRunner.assertion_failure_count = 0
+    AssertingRunner.assertion_failures.clear()
+
+
+def print_assertion_summary():
+    """
+    Prints a summary of all assertion failures to the console.
+    """
+    failure_count = AssertingRunner.assertion_failure_count
+    failures = AssertingRunner.assertion_failures
+
+    if failure_count == 0:
+        print("\n" + "="*80)
+        print("ASSERTION SUMMARY: All assertions passed!")
+        print("="*80)
+    else:
+        print("\n" + "="*80)
+        print(f"ASSERTION SUMMARY: {failure_count} assertion(s) failed")
+        print("="*80)
+        for i, failure_msg in enumerate(failures, 1):
+            print(f"{i}. {failure_msg}")
+        print("="*80)
+
+
 def register_runner(operation_type, runner, **kwargs):
     logger = logging.getLogger(__name__)
     async_runner = kwargs.get("async_runner", False)
@@ -372,6 +410,8 @@ class MultiClientRunner(Runner, Delegator):
 
 class AssertingRunner(Runner, Delegator):
     assertions_enabled = False
+    assertion_failures = []  # Class-level list to store all assertion failures
+    assertion_failure_count = 0  # Class-level counter for failures
 
     def __init__(self, delegate):
         super().__init__(delegate=delegate)
@@ -433,8 +473,14 @@ class AssertingRunner(Runner, Delegator):
             else:
                 msg = f"Expected [{path}] to be {predicate_name} [{expected_value}] but was [{actual_value}]."
 
+            # Store the failure
+            AssertingRunner.assertion_failures.append(msg)
+            AssertingRunner.assertion_failure_count += 1
+
+            # Log the failure
+            self.logger.warning("Assertion failed: %s", msg)
+
             # raise exceptions.BenchmarkTaskAssertionError(msg)
-            print("Assertion error: ", msg)
 
     async def __call__(self, *args):
         params = args[1]

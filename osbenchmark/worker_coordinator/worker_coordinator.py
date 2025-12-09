@@ -739,6 +739,8 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         ))
 
     def on_benchmark_complete(self, metrics):
+        # Print assertion summary before completing
+        runner.print_assertion_summary()
         self.send(self.start_sender, BenchmarkComplete(metrics))
 
 
@@ -2178,6 +2180,8 @@ class AsyncIoAdapter:
 
         self.logger.info("Task assertions enabled: %s", str(self.assertions_enabled))
         runner.enable_assertions(self.assertions_enabled)
+        # Reset assertion failures at the start of each benchmark run
+        runner.reset_assertion_failures()
 
         aws = []
         # A parameter source should only be created once per task - it is partitioned later on per client.
