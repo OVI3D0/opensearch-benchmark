@@ -160,7 +160,12 @@ def reset_assertion_failures():
 def print_assertion_summary():
     """
     Prints a summary of all assertion failures to the console.
+    Only prints if assertions were enabled for this benchmark run.
     """
+    # Only print if assertions were enabled
+    if not AssertingRunner.assertions_enabled:
+        return
+
     failure_count = AssertingRunner.assertion_failure_count
     failures = AssertingRunner.assertion_failures
 
@@ -464,7 +469,17 @@ class AssertingRunner(Runner, Delegator):
         path = assertion["property"]
         predicate_name = assertion["condition"]
         expected_value = assertion["value"]
-        actual_value = self._resolve_property_path(properties, path, op_name or "<unnamed>")
+
+        try:
+            actual_value = self._resolve_property_path(properties, path, op_name or "<unnamed>")
+        except exceptions.BenchmarkTaskAssertionError as e:
+            # Property path resolution failed - treat as assertion failure
+            msg = str(e)
+            AssertingRunner.assertion_failures.append(msg)
+            AssertingRunner.assertion_failure_count += 1
+            self.logger.warning("Assertion failed (path resolution error): %s", msg)
+            return
+
         predicate = self.predicates[predicate_name]
         success = predicate(expected_value, actual_value)
         if not success:
