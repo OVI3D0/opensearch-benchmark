@@ -474,6 +474,7 @@ class AssertingRunner(Runner, Delegator):
             AssertingRunner.assertion_failures.append(msg)
             AssertingRunner.assertion_failure_count += 1
             self.logger.warning("Assertion failed (path resolution error): %s", msg)
+            print(f"[ASSERTION FAILED] {msg}")
             return
 
         predicate = self.predicates[predicate_name]
@@ -490,6 +491,8 @@ class AssertingRunner(Runner, Delegator):
 
             # Log the failure
             self.logger.warning("Assertion failed: %s", msg)
+            # Print immediately to console
+            print(f"[ASSERTION FAILED] {msg}")
 
             # raise exceptions.BenchmarkTaskAssertionError(msg)
 
@@ -498,7 +501,10 @@ class AssertingRunner(Runner, Delegator):
         return_value = await self.delegate(*args)
         if AssertingRunner.assertions_enabled and "assertions" in params:
             op_name = params.get("name")
+            self.logger.info("Checking assertions for [%s], assertions_enabled=%s, has_assertions=%s",
+                           op_name, AssertingRunner.assertions_enabled, "assertions" in params)
             if isinstance(return_value, dict):
+                self.logger.info("Return value is dict with keys: %s", list(return_value.keys()))
                 for assertion in params["assertions"]:
                     self.check_assertion(op_name, assertion, return_value)
             else:

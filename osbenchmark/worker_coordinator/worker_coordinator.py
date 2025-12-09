@@ -739,8 +739,6 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         ))
 
     def on_benchmark_complete(self, metrics):
-        # Print assertion summary before completing
-        runner.print_assertion_summary()
         self.send(self.start_sender, BenchmarkComplete(metrics))
 
 
