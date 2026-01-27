@@ -1579,6 +1579,76 @@ class Query(Runner):
             result["recall_time_ms"] = recall_processing_time
             return result
 
+        async def _vector_search_minimal(opensearch, params):
+            """
+            Minimal vector search for streaming metrics mode.
+
+            This function performs the search but does NOT calculate recall inline.
+            Instead, it extracts and returns candidate IDs so that recall can be
+            calculated asynchronously by MetricsActor.
+
+            This reduces hot-path time from ~50-500μs to ~5-10μs per request.
+
+            Returns:
+                dict with:
+                - weight, unit, success: Standard runner response fields
+                - candidate_ids: List of IDs from search response (for deferred recall)
+                - query_index: Index into neighbors dataset (for deferred recall)
+                - hits, hits_relation, timed_out, took: If detailed_results is True
+            """
+            def _get_field_value(content, field_name):
+                if field_name in content:
+                    return content[field_name]
+                if "fields" in content and field_name in content["fields"]:
+                    return content["fields"][field_name][0]
+                if "_source" in content:
+                    return _get_field_value(content["_source"], field_name)
+                return None
+
+            result = {
+                "weight": 1,
+                "unit": "ops",
+                "success": True,
+            }
+
+            doc_type = params.get("type")
+            response = await self._raw_search(opensearch, doc_type, index, body, request_params, headers=headers)
+
+            if detailed_results:
+                props = parse(response, ["hits.total", "hits.total.value", "hits.total.relation", "timed_out", "took"])
+                hits_total = props.get("hits.total.value", props.get("hits.total", 0))
+                hits_relation = props.get("hits.total.relation", "eq")
+                timed_out = props.get("timed_out", False)
+                took = props.get("took", 0)
+
+                result.update({
+                    "hits": hits_total,
+                    "hits_relation": hits_relation,
+                    "timed_out": timed_out,
+                    "took": took
+                })
+
+            # Minimal response parsing - just extract candidate IDs for deferred recall
+            response_json = json.loads(response.getvalue())
+
+            # Add profile metrics if requested
+            add_profile_to_results(response_json, params, result)
+
+            # Extract candidate IDs for deferred recall calculation
+            if response_json and "hits" in response_json and "hits" in response_json["hits"]:
+                id_field = params.get("id-field-name", "_id")
+                candidate_ids = []
+                for hit in response_json["hits"]["hits"]:
+                    field_value = _get_field_value(hit, id_field)
+                    if field_value is not None:
+                        candidate_ids.append(field_value)
+
+                # Store for deferred recall calculation by MetricsActor
+                result["candidate_ids"] = candidate_ids
+                result["query_index"] = params.get("query-index")  # Index into neighbors dataset
+
+            return result
+
         search_method = params.get("operation-type")
         if search_method == "paginated-search":
             return await _search_after_query(opensearch, params)
@@ -1589,6 +1659,9 @@ class Query(Runner):
                                                 "and will be removed in a future release. Use 'scroll-search' instead.")
             return await _scroll_query(opensearch, params)
         elif search_method == "vector-search":
+            # Use minimal path when streaming metrics is enabled (defer recall to MetricsActor)
+            if params.get("defer-recall-calculation", False):
+                return await _vector_search_minimal(opensearch, params)
             return await _vector_search_query_with_recall(opensearch, params)
         else:
             return await _request_body_query(opensearch, params)
