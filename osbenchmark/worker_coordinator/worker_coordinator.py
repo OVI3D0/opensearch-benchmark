@@ -1500,14 +1500,17 @@ class WorkerCoordinator:
         self.profile_metrics_post_processor = None
 
         # Streaming metrics infrastructure (v2 - Thespian message passing)
-        # Enabled by default for better performance. Defers metric calculations to MetricsActor.
+        # Disabled by default until performance issues are resolved.
+        # To enable: set streaming.metrics.enabled=true in benchmark.ini [worker_coordinator] section
         # Workers batch RawSamples locally and send via Thespian (no Manager().Queue()).
         self.streaming_metrics_enabled = self.config.opts(
             "worker_coordinator", "streaming.metrics.enabled",
-            mandatory=False, default_value=True
+            mandatory=False, default_value=False
         )
         if self.streaming_metrics_enabled:
             self.logger.info("Streaming metrics mode enabled (Thespian message passing)")
+        else:
+            self.logger.debug("Streaming metrics mode disabled (using legacy path)")
 
         self.number_of_steps = 0
         self.currently_completed = 0
@@ -2717,6 +2720,12 @@ class AsyncIoAdapter:
         # Streaming metrics (v2 Thespian)
         self.raw_sampler = raw_sampler
         self.streaming_metrics_enabled = streaming_metrics_enabled
+        # Dedicated client mode: each executor gets its own OpenSearch client to avoid connection pool contention.
+        # Enable for high-throughput benchmarks. Disable to reduce memory usage.
+        self.dedicated_client_mode = self.cfg.opts(
+            "worker_coordinator", "dedicated.client.mode",
+            mandatory=False, default_value=True
+        )
 
     def __call__(self, *args, **kwargs):
         # only possible in Python 3.7+ (has introduced get_running_loop)
@@ -2738,7 +2747,8 @@ class AsyncIoAdapter:
         self.logger.error("Uncaught exception in event loop: %s", context)
 
     async def run(self):
-        def os_clients(all_hosts, all_client_options):
+        def create_os_client(all_hosts, all_client_options):
+            """Create a single OpenSearch client."""
             opensearch = {}
             grpc_hosts = self.cfg.opts("client", "grpc_hosts", mandatory=False)
 
@@ -2753,16 +2763,30 @@ class AsyncIoAdapter:
                 opensearch[cluster_name] = unified_client_factory.create_async()
             return opensearch
 
-        # Properly size the internal connection pool to match the number of expected clients but allow the user
-        # to override it if needed.
-        client_count = len(self.task_allocations)
-        opensearch = os_clients(self.cfg.opts("client", "hosts").all_hosts,
-                        self.cfg.opts("client", "options").with_max_connections(client_count))
-
         self.logger.info("Task assertions enabled: %s", str(self.assertions_enabled))
         runner.enable_assertions(self.assertions_enabled)
 
+        # Get host/options config once
+        all_hosts = self.cfg.opts("client", "hosts").all_hosts
+        all_client_options = self.cfg.opts("client", "options")
+        client_count = len(self.task_allocations)
+
         aws = []
+        all_clients = []  # Track all clients for cleanup
+
+        # Choose client mode based on config
+        if self.dedicated_client_mode:
+            # DEDICATED MODE: Each executor gets its own OpenSearch client.
+            # Eliminates connection pool contention for high-throughput benchmarks.
+            self.logger.info("Using dedicated client mode: creating %d separate OpenSearch clients", client_count)
+            shared_opensearch = None
+        else:
+            # SHARED MODE (legacy): All executors share one OpenSearch client.
+            # Lower memory usage but potential connection pool contention.
+            self.logger.info("Using shared client mode: all %d executors share one OpenSearch client", client_count)
+            shared_opensearch = create_os_client(all_hosts, all_client_options.with_max_connections(client_count))
+            all_clients.append(shared_opensearch)
+
         # A parameter source should only be created once per task - it is partitioned later on per client.
         params_per_task = {}
         for client_id, task_allocation in self.task_allocations:
@@ -2770,6 +2794,16 @@ class AsyncIoAdapter:
             if task not in params_per_task:
                 param_source = workload.operation_parameters(self.workload, task)
                 params_per_task[task] = param_source
+
+            if self.dedicated_client_mode:
+                # Create a DEDICATED OpenSearch client for this executor.
+                # Connection pool size is small since each executor has exclusive access.
+                opensearch = create_os_client(all_hosts, all_client_options.with_max_connections(4))
+                all_clients.append(opensearch)
+            else:
+                # Use the shared client
+                opensearch = shared_opensearch
+
             # We cannot use the global client index here because we need to support parallel execution of tasks
             # with multiple clients. Consider the following scenario:
             #
@@ -2785,6 +2819,7 @@ class AsyncIoAdapter:
                 raw_sampler=self.raw_sampler, streaming_metrics_enabled=self.streaming_metrics_enabled)
             final_executor = AsyncProfiler(async_executor) if self.profiling_enabled else async_executor
             aws.append(final_executor())
+
         run_start = time.perf_counter()
         try:
             _ = await asyncio.gather(*aws)
@@ -2794,10 +2829,12 @@ class AsyncIoAdapter:
             await asyncio.get_event_loop().shutdown_asyncgens()
             shutdown_asyncgens_end = time.perf_counter()
             self.logger.info("Total time to shutdown asyncgens: %f seconds.", (shutdown_asyncgens_end - run_end))
-            for s in opensearch.values():
-                await s.transport.close()
+            # Close all clients
+            for opensearch in all_clients:
+                for s in opensearch.values():
+                    await s.transport.close()
             transport_close_end = time.perf_counter()
-            self.logger.info("Total time to close transports: %f seconds.", (shutdown_asyncgens_end - transport_close_end))
+            self.logger.info("Total time to close %d transport(s): %f seconds.", len(all_clients), (transport_close_end - shutdown_asyncgens_end))
 
 
 class AsyncProfiler:
@@ -3001,11 +3038,11 @@ class AsyncExecutor:
         """Process results from a request.
 
         When streaming_metrics_enabled is True, this method queues minimal RawSample
-        objects to the shared_sample_queue for async processing by MetricsActor.
+        objects to the raw_sampler for async processing by MetricsActor.
         All metric calculations are deferred.
 
         When streaming_metrics_enabled is False, uses the legacy path with inline
-        calculations and sampler queues.
+        calculations and sampler queues (matches original main branch structure).
         """
         # Handle cases where the request was skipped (no-op)
         if result_data["request_meta_data"].get("skipped_request"):
@@ -3014,7 +3051,20 @@ class AsyncExecutor:
             )
             return self.complete.is_set()
 
-        # Always notify scheduler (needed for scheduling regardless of metrics mode)
+        # For streaming path, take a different code path entirely
+        if self.streaming_metrics_enabled:
+            return self._process_results_streaming(result_data, total_start, client_state,
+                                                   task_progress, add_profile_metric_sample)
+
+        # ============================================================
+        # LEGACY PATH - matches original main branch structure exactly
+        # ============================================================
+        service_time = result_data["request_end"] - result_data["request_start"]
+        client_processing_time = (result_data["client_request_end"] - result_data[
+            "client_request_start"]) - service_time
+        processing_time = result_data["processing_end"] - result_data["processing_start"]
+        time_period = result_data["request_end"] - total_start
+
         self.schedule_handle.after_request(
             result_data["processing_end"],
             result_data["total_ops"],
@@ -3022,7 +3072,10 @@ class AsyncExecutor:
             result_data["request_meta_data"]
         )
 
-        # Determine completion status (needed for both paths)
+        throughput = result_data["request_meta_data"].pop("throughput", None)
+        latency = (result_data["request_end"] - (total_start + self.expected_scheduled_time)
+                   if result_data["throughput_throttled"] else service_time)
+
         runner_completed = getattr(self.runner, "completed", False)
         runner_task_progress = getattr(self.runner, "task_progress", None)
 
@@ -3039,45 +3092,56 @@ class AsyncExecutor:
             progress = task_progress
 
         if client_state:
-            if self.streaming_metrics_enabled:
-                # ============================================================
-                # STREAMING METRICS PATH - Minimal hot path, defer calculations
-                # ============================================================
-                self._queue_raw_sample(result_data, total_start, progress, add_profile_metric_sample)
+            if add_profile_metric_sample:
+                self.profile_sampler.add(
+                    self.task, self.client_id, self.sample_type,
+                    result_data["request_meta_data"],
+                    result_data["absolute_processing_start"],
+                    result_data["request_start"],
+                    time_period,
+                    progress,
+                    result_data["request_meta_data"].pop("dependent_timing", None))
             else:
-                # ============================================================
-                # LEGACY PATH - Inline calculations
-                # ============================================================
-                service_time = result_data["request_end"] - result_data["request_start"]
-                client_processing_time = (result_data["client_request_end"] - result_data[
-                    "client_request_start"]) - service_time
-                processing_time = result_data["processing_end"] - result_data["processing_start"]
-                time_period = result_data["request_end"] - total_start
+                self.sampler.add(
+                    self.task, self.client_id, self.sample_type,
+                    result_data["request_meta_data"],
+                    result_data["absolute_processing_start"],
+                    result_data["request_start"],
+                    latency, service_time, client_processing_time, processing_time,
+                    throughput, result_data["total_ops"], result_data["total_ops_unit"],
+                    time_period, progress,
+                    result_data["request_meta_data"].pop("dependent_timing", None)
+                )
+        return completed
 
-                throughput = result_data["request_meta_data"].pop("throughput", None)
-                latency = (result_data["request_end"] - (total_start + self.expected_scheduled_time)
-                           if result_data["throughput_throttled"] else service_time)
+    def _process_results_streaming(self, result_data: dict, total_start: float, client_state: bool,
+                                   task_progress: tuple, add_profile_metric_sample: bool = False) -> bool:
+        """Streaming metrics path - defers all calculations to MetricsActor."""
+        self.schedule_handle.after_request(
+            result_data["processing_end"],
+            result_data["total_ops"],
+            result_data["total_ops_unit"],
+            result_data["request_meta_data"]
+        )
 
-                if add_profile_metric_sample:
-                    self.profile_sampler.add(
-                        self.task, self.client_id, self.sample_type,
-                        result_data["request_meta_data"],
-                        result_data["absolute_processing_start"],
-                        result_data["request_start"],
-                        time_period,
-                        progress,
-                        result_data["request_meta_data"].pop("dependent_timing", None))
-                else:
-                    self.sampler.add(
-                        self.task, self.client_id, self.sample_type,
-                        result_data["request_meta_data"],
-                        result_data["absolute_processing_start"],
-                        result_data["request_start"],
-                        latency, service_time, client_processing_time, processing_time,
-                        throughput, result_data["total_ops"], result_data["total_ops_unit"],
-                        time_period, progress,
-                        result_data["request_meta_data"].pop("dependent_timing", None)
-                    )
+        runner_completed = getattr(self.runner, "completed", False)
+        runner_task_progress = getattr(self.runner, "task_progress", None)
+
+        if self.task_completes_parent:
+            completed = runner_completed
+        else:
+            completed = self.complete.is_set() or runner_completed
+
+        if completed:
+            progress = 1.0
+        elif runner_task_progress is not None:
+            progress = runner_task_progress
+        else:
+            progress = task_progress
+
+        if client_state:
+            self._queue_raw_sample(result_data, total_start, progress, add_profile_metric_sample)
+
         return completed
 
     def _queue_raw_sample(self, result_data: dict, total_start: float, progress: float,
