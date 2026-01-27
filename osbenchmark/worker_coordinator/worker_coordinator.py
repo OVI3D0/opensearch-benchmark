@@ -216,6 +216,198 @@ class TaskFinished:
 
 ##################################
 #
+# High-Performance Executor (VDBBench-style)
+#
+# Bypasses Thespian actors entirely for maximum throughput.
+# Uses ProcessPoolExecutor with dedicated clients per process.
+#
+##################################
+
+def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration, k=100):
+    """
+    Worker function that runs in a separate process.
+    Creates its own OpenSearch client and runs a tight query loop.
+
+    This is designed to be picklable for ProcessPoolExecutor.
+    """
+    import time
+    import urllib3
+    from opensearchpy import OpenSearch
+
+    # Suppress SSL warnings if verify_certs is disabled
+    if client_options.get("verify_certs") is False:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # Create dedicated client for this process
+    try:
+        os_client = OpenSearch(
+            hosts=hosts,
+            **client_options
+        )
+    except Exception as e:
+        return {
+            "worker_id": worker_id,
+            "count": 0,
+            "duration": 0,
+            "latencies": [],
+            "error": f"Failed to create client: {e}"
+        }
+
+    # Run tight loop like VDBBench
+    start_time = time.perf_counter()
+    count = 0
+    latencies = []
+    errors = 0
+
+    while time.perf_counter() - start_time < duration:
+        t0 = time.perf_counter()
+        try:
+            os_client.search(
+                index=index,
+                body=body,
+                _source=False,
+                docvalue_fields=["_id"],
+                stored_fields="_none_",
+            )
+            latencies.append(time.perf_counter() - t0)
+            count += 1
+        except Exception as e:
+            # Record latency but track error
+            latencies.append(time.perf_counter() - t0)
+            errors += 1
+            # Don't let errors stop the loop, but stop if too many
+            if errors > 100:
+                break
+
+    total_duration = time.perf_counter() - start_time
+
+    try:
+        os_client.close()
+    except Exception:
+        pass
+
+    return {
+        "worker_id": worker_id,
+        "count": count,
+        "duration": total_duration,
+        "latencies": latencies,
+        "errors": errors,
+    }
+
+
+class HighPerformanceExecutor:
+    """
+    VDBBench-style executor using ProcessPoolExecutor.
+
+    Bypasses Thespian actors entirely for maximum throughput.
+    Each process gets its own OpenSearch client and runs a tight loop.
+
+    Usage:
+        executor = HighPerformanceExecutor(hosts, client_options)
+        results = executor.run(
+            num_clients=64,
+            duration=30,
+            index="my_index",
+            body={"query": {"match_all": {}}}
+        )
+    """
+
+    def __init__(self, hosts, client_options):
+        self.hosts = hosts
+        self.client_options = client_options
+        self.logger = logging.getLogger(__name__)
+
+    def run(self, num_clients, duration, index, body, k=100):
+        """
+        Run high-performance benchmark.
+
+        Args:
+            num_clients: Number of parallel worker processes
+            duration: How long to run each worker (seconds)
+            index: Index to query
+            body: Query body
+            k: Top-k for vector search (if applicable)
+
+        Returns:
+            dict with aggregated results:
+            - total_ops: Total operations across all workers
+            - total_duration: Wall clock time
+            - qps: Queries per second
+            - latencies: All latencies from all workers
+            - per_worker: Per-worker breakdown
+        """
+        self.logger.info("Starting high-performance execution with %d clients for %d seconds",
+                        num_clients, duration)
+
+        # Use 'spawn' context for clean process isolation (like VDBBench)
+        mp_context = multiprocessing.get_context('spawn')
+
+        start_time = time.perf_counter()
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=num_clients,
+            mp_context=mp_context
+        ) as executor:
+            # Submit all workers
+            futures = [
+                executor.submit(
+                    _hp_worker_loop,
+                    worker_id=i,
+                    hosts=self.hosts,
+                    client_options=self.client_options,
+                    index=index,
+                    body=body,
+                    duration=duration,
+                    k=k
+                )
+                for i in range(num_clients)
+            ]
+
+            # Collect results
+            results = [f.result() for f in futures]
+
+        total_duration = time.perf_counter() - start_time
+
+        # Aggregate results
+        total_ops = sum(r["count"] for r in results)
+        total_errors = sum(r.get("errors", 0) for r in results)
+        all_latencies = []
+        for r in results:
+            all_latencies.extend(r["latencies"])
+            if "error" in r:
+                self.logger.error("Worker %d failed: %s", r["worker_id"], r["error"])
+
+        qps = total_ops / total_duration if total_duration > 0 else 0
+
+        # Calculate percentiles
+        all_latencies.sort()
+        n = len(all_latencies)
+        p50 = all_latencies[int(n * 0.50)] * 1000 if n > 0 else 0  # ms
+        p90 = all_latencies[int(n * 0.90)] * 1000 if n > 0 else 0
+        p99 = all_latencies[int(n * 0.99)] * 1000 if n > 0 else 0
+        avg = (sum(all_latencies) / n) * 1000 if n > 0 else 0
+
+        self.logger.info(
+            "High-performance execution complete: %d ops in %.2fs = %.2f QPS, "
+            "latency p50=%.2fms p90=%.2fms p99=%.2fms avg=%.2fms, errors=%d",
+            total_ops, total_duration, qps, p50, p90, p99, avg, total_errors
+        )
+
+        return {
+            "total_ops": total_ops,
+            "total_duration": total_duration,
+            "qps": qps,
+            "latency_p50_ms": p50,
+            "latency_p90_ms": p90,
+            "latency_p99_ms": p99,
+            "latency_avg_ms": avg,
+            "total_errors": total_errors,
+            "per_worker": results,
+        }
+
+
+##################################
+#
 # Streaming Metrics Infrastructure
 #
 ##################################
@@ -1512,6 +1704,15 @@ class WorkerCoordinator:
         else:
             self.logger.debug("Streaming metrics mode disabled (using legacy path)")
 
+        # High-performance mode: bypasses Thespian actors entirely, uses ProcessPoolExecutor
+        # like VDBBench for maximum throughput. Enable for high-throughput benchmarks.
+        self.high_performance_mode = self.config.opts(
+            "worker_coordinator", "high.performance.mode",
+            mandatory=False, default_value=True  # Default ON for POC
+        )
+        if self.high_performance_mode:
+            self.logger.info("High-performance mode ENABLED (ProcessPoolExecutor, bypasses Thespian)")
+
         self.number_of_steps = 0
         self.currently_completed = 0
         self.workers_completed_current_step = {}
@@ -1633,6 +1834,123 @@ class WorkerCoordinator:
 
         self.target.prepare_workload([h["host"] for h in self.worker_ips], self.config, self.workload)
 
+    def _run_high_performance_benchmark(self):
+        """
+        Run benchmark using VDBBench-style ProcessPoolExecutor.
+        Bypasses Thespian actors entirely for maximum throughput.
+        """
+        self.logger.info("=== HIGH-PERFORMANCE MODE ===")
+        self.logger.info("Bypassing Thespian actors, using ProcessPoolExecutor")
+
+        # Get hosts and client options
+        all_hosts = self.config.opts("client", "hosts").all_hosts
+        all_client_options = self.config.opts("client", "options").all_client_options
+
+        # For now, use the default cluster
+        cluster_name = "default"
+        hosts = all_hosts[cluster_name]
+        client_options = dict(all_client_options[cluster_name])
+
+        # Convert hosts to format expected by opensearch-py
+        host_list = []
+        for h in hosts:
+            host_entry = {"host": h.get("host", "localhost"), "port": h.get("port", 9200)}
+            if client_options.get("use_ssl") or client_options.get("scheme") == "https":
+                host_entry["scheme"] = "https"
+            else:
+                host_entry["scheme"] = "http"
+            host_list.append(host_entry)
+
+        # Prepare client options for opensearch-py
+        os_client_options = {}
+        if client_options.get("use_ssl") or client_options.get("scheme") == "https":
+            os_client_options["use_ssl"] = True
+        if client_options.get("verify_certs") is False:
+            os_client_options["verify_certs"] = False
+            os_client_options["ssl_show_warn"] = False
+        if "basic_auth_user" in client_options and "basic_auth_password" in client_options:
+            os_client_options["http_auth"] = (
+                client_options["basic_auth_user"],
+                client_options["basic_auth_password"]
+            )
+        if client_options.get("timeout"):
+            os_client_options["timeout"] = client_options["timeout"]
+
+        # Extract search parameters from test procedure
+        # Find the first search task
+        search_task = None
+        for task_group in self.test_procedure.schedule:
+            for task in task_group:
+                op_type = task.operation.type if hasattr(task.operation, 'type') else task.operation.operation_type
+                if op_type in ["search", "vector-search"]:
+                    search_task = task
+                    break
+            if search_task:
+                break
+
+        if not search_task:
+            self.logger.error("No search task found in test procedure, falling back to legacy mode")
+            self.high_performance_mode = False
+            self._start_benchmark_legacy()
+            return
+
+        # Get search parameters
+        num_clients = search_task.clients
+        index = search_task.operation.param_source_params.get("index", "target_index")
+        body = search_task.operation.param_source_params.get("body", {"query": {"match_all": {}}})
+
+        # Duration from warmup-time-period or default 30s
+        duration = self.config.opts("workload", "warmup.time.period", mandatory=False, default_value=30)
+
+        self.logger.info("High-performance search config:")
+        self.logger.info("  Hosts: %s", host_list)
+        self.logger.info("  Clients: %d", num_clients)
+        self.logger.info("  Index: %s", index)
+        self.logger.info("  Duration: %d seconds", duration)
+
+        # Run the benchmark
+        executor = HighPerformanceExecutor(host_list, os_client_options)
+        results = executor.run(
+            num_clients=num_clients,
+            duration=duration,
+            index=index,
+            body=body
+        )
+
+        # Store results in metrics store
+        self.logger.info("=== HIGH-PERFORMANCE RESULTS ===")
+        self.logger.info("Total ops: %d", results["total_ops"])
+        self.logger.info("Duration: %.2f seconds", results["total_duration"])
+        self.logger.info("Throughput: %.2f ops/s", results["qps"])
+        self.logger.info("Latency p50: %.2f ms", results["latency_p50_ms"])
+        self.logger.info("Latency p90: %.2f ms", results["latency_p90_ms"])
+        self.logger.info("Latency p99: %.2f ms", results["latency_p99_ms"])
+        self.logger.info("Latency avg: %.2f ms", results["latency_avg_ms"])
+
+        # Write metrics to metrics store
+        if self.metrics_store:
+            self.metrics_store.put_value_cluster_level(
+                name="throughput",
+                value=results["qps"],
+                unit="ops/s",
+                task="high-performance-search",
+                operation="search",
+                operation_type="search"
+            )
+            self.metrics_store.put_value_cluster_level(
+                name="service_time",
+                value=results["latency_avg_ms"],
+                unit="ms",
+                task="high-performance-search",
+                operation="search",
+                operation_type="search"
+            )
+
+        # Signal completion
+        self.telemetry.on_benchmark_stop()
+        final_results = self.metrics_store.to_externalizable(clear=True) if self.metrics_store else {}
+        self.target.on_benchmark_complete(final_results)
+
     def start_benchmark(self):
         self.logger.info("OSB is about to start.")
         # ensure relative time starts when the benchmark starts.
@@ -1640,6 +1958,11 @@ class WorkerCoordinator:
         self.logger.info("Attaching cluster-level telemetry devices.")
         self.telemetry.on_benchmark_start()
         self.logger.info("Cluster-level telemetry devices are now attached.")
+
+        # High-performance mode: bypass Thespian entirely
+        if self.high_performance_mode:
+            self._run_high_performance_benchmark()
+            return
         # if redline testing or load testing is enabled, modify the client + throughput number for the task(s)
         # target throughput + clients will then be equal to the qps passed in through --redline-test or --load-test
         redline_enabled = self.config.opts("workload", "redline.test", mandatory=False, default_value=False)
@@ -2227,29 +2550,33 @@ class Worker(actor.BenchmarkActor):
 
     @actor.no_retry("worker")  # pylint: disable=no-value-for-parameter
     def receiveMsg_StartWorker(self, msg, sender):
-        self.logger.info("Worker[%d] is about to start.", msg.worker_id)
-        self.master = sender
-        self.worker_id = msg.worker_id
-        self.config = load_local_config(msg.config)
-        self.on_error = self.config.opts("worker_coordinator", "on.error")
-        self.sample_queue_size = int(self.config.opts("reporting", "sample.queue.size", mandatory=False, default_value=1 << 20))
-        self.workload = msg.workload
-        workload.set_absolute_data_path(self.config, self.workload)
-        self.client_allocations = msg.client_allocations
-        self.current_task_index = 0
-        self.cancel.clear()
-        self.feedback_actor = msg.feedback_actor
-        self.shared_states = msg.shared_states
-        self.error_queue = msg.error_queue
-        self.queue_lock = msg.queue_lock
-        self.streaming_metrics_enabled = msg.streaming_metrics_enabled  # For streaming metrics mode (v2 Thespian)
-        # we need to wake up more often in test mode
-        if self.config.opts("workload", "test.mode.enabled"):
-            self.wakeup_interval = 0.5
-        runner.register_default_runners()
-        if self.workload.has_plugins:
-            workload.load_workload_plugins(self.config, self.workload.name, runner.register_runner, scheduler.register_scheduler)
-        self.drive()
+        try:
+            self.logger.info("Worker[%d] is about to start.", msg.worker_id)
+            self.master = sender
+            self.worker_id = msg.worker_id
+            self.config = load_local_config(msg.config)
+            self.on_error = self.config.opts("worker_coordinator", "on.error")
+            self.sample_queue_size = int(self.config.opts("reporting", "sample.queue.size", mandatory=False, default_value=1 << 20))
+            self.workload = msg.workload
+            workload.set_absolute_data_path(self.config, self.workload)
+            self.client_allocations = msg.client_allocations
+            self.current_task_index = 0
+            self.cancel.clear()
+            self.feedback_actor = msg.feedback_actor
+            self.shared_states = msg.shared_states
+            self.error_queue = msg.error_queue
+            self.queue_lock = msg.queue_lock
+            self.streaming_metrics_enabled = msg.streaming_metrics_enabled  # For streaming metrics mode (v2 Thespian)
+            # we need to wake up more often in test mode
+            if self.config.opts("workload", "test.mode.enabled"):
+                self.wakeup_interval = 0.5
+            runner.register_default_runners()
+            if self.workload.has_plugins:
+                workload.load_workload_plugins(self.config, self.workload.name, runner.register_runner, scheduler.register_scheduler)
+            self.drive()
+        except Exception as e:
+            self.logger.error("Worker[%d] failed during startup: %s", msg.worker_id, e, exc_info=True)
+            raise
 
     @actor.no_retry("worker")  # pylint: disable=no-value-for-parameter
     def receiveMsg_Drive(self, msg, sender):
@@ -2721,7 +3048,7 @@ class AsyncIoAdapter:
         self.raw_sampler = raw_sampler
         self.streaming_metrics_enabled = streaming_metrics_enabled
         # Dedicated client mode: each executor gets its own OpenSearch client to avoid connection pool contention.
-        # Enable for high-throughput benchmarks. Disable to reduce memory usage.
+        # Enable for high-throughput benchmarks.
         self.dedicated_client_mode = self.cfg.opts(
             "worker_coordinator", "dedicated.client.mode",
             mandatory=False, default_value=True
@@ -2740,6 +3067,9 @@ class AsyncIoAdapter:
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self.run())
+        except Exception as e:
+            self.logger.error("AsyncIoAdapter crashed with exception: %s", e, exc_info=True)
+            raise
         finally:
             loop.close()
 
@@ -2798,8 +3128,14 @@ class AsyncIoAdapter:
             if self.dedicated_client_mode:
                 # Create a DEDICATED OpenSearch client for this executor.
                 # Connection pool size is small since each executor has exclusive access.
-                opensearch = create_os_client(all_hosts, all_client_options.with_max_connections(4))
-                all_clients.append(opensearch)
+                try:
+                    self.logger.debug("Creating dedicated client %d of %d", client_id + 1, client_count)
+                    opensearch = create_os_client(all_hosts, all_client_options.with_max_connections(4))
+                    all_clients.append(opensearch)
+                    self.logger.debug("Successfully created dedicated client %d", client_id + 1)
+                except Exception as e:
+                    self.logger.error("Failed to create dedicated client %d: %s", client_id + 1, e)
+                    raise
             else:
                 # Use the shared client
                 opensearch = shared_opensearch
