@@ -2306,7 +2306,8 @@ class WorkerCoordinator:
         if self.metrics_store:
             task_name = search_task.name if search_task else "high-performance-search"
             op_name = search_task.operation.name if search_task.operation else "search"
-            op_type = "vector-search"
+            # Use actual operation type from task - must match what GlobalStatsCalculator queries
+            op_type = search_task.operation.type if hasattr(search_task.operation, 'type') else "vector-search"
 
             from osbenchmark.metrics import SampleType
             sample_type = SampleType.Normal
