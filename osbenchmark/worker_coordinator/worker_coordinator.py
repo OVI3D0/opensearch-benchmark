@@ -2742,14 +2742,10 @@ class AsyncIoAdapter:
             opensearch = {}
             grpc_hosts = self.cfg.opts("client", "grpc_hosts", mandatory=False)
 
-            # If gRPC hosts are configured and not empty, use them. Otherwise, use defaults for gRPC operations.
-            if grpc_hosts and grpc_hosts.all_hosts:
-                # Use the provided gRPC hosts
-                pass
-            else:
-                # Provide default gRPC hosts when using gRPC operations
-                # Default: localhost:9400 (matching current environment variable defaults)
-                grpc_hosts = opts.TargetHosts("localhost:9400")
+            # Only use gRPC hosts if explicitly configured. Don't default to localhost:9400
+            # as this creates unnecessary channels and logs confusing messages.
+            if not (grpc_hosts and grpc_hosts.all_hosts):
+                grpc_hosts = None
 
             for cluster_name, cluster_hosts in all_hosts.items():
                 rest_client_factory = client.OsClientFactory(cluster_hosts, all_client_options[cluster_name])

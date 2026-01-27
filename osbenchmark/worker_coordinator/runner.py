@@ -1628,24 +1628,33 @@ class Query(Runner):
                     "took": took
                 })
 
-            # Minimal response parsing - just extract candidate IDs for deferred recall
-            response_json = json.loads(response.getvalue())
+            # Only parse JSON and extract candidates if recall calculation is enabled
+            # This mirrors the legacy path which skips candidate extraction when recall is disabled
+            should_calculate_recall = params.get("calculate-recall", True) and params.get("neighbors") is not None
 
-            # Add profile metrics if requested
-            add_profile_to_results(response_json, params, result)
+            if should_calculate_recall:
+                # Parse JSON and extract candidate IDs for deferred recall
+                response_json = json.loads(response.getvalue())
 
-            # Extract candidate IDs for deferred recall calculation
-            if response_json and "hits" in response_json and "hits" in response_json["hits"]:
-                id_field = params.get("id-field-name", "_id")
-                candidate_ids = []
-                for hit in response_json["hits"]["hits"]:
-                    field_value = _get_field_value(hit, id_field)
-                    if field_value is not None:
-                        candidate_ids.append(field_value)
+                # Add profile metrics if requested
+                add_profile_to_results(response_json, params, result)
 
-                # Store for deferred recall calculation by MetricsActor
-                result["candidate_ids"] = candidate_ids
-                result["query_index"] = params.get("query-index")  # Index into neighbors dataset
+                # Extract candidate IDs for deferred recall calculation
+                if response_json and "hits" in response_json and "hits" in response_json["hits"]:
+                    id_field = params.get("id-field-name", "_id")
+                    candidate_ids = []
+                    for hit in response_json["hits"]["hits"]:
+                        field_value = _get_field_value(hit, id_field)
+                        if field_value is not None:
+                            candidate_ids.append(field_value)
+
+                    # Store for deferred recall calculation by MetricsActor
+                    result["candidate_ids"] = candidate_ids
+                    result["query_index"] = params.get("query-index")  # Index into neighbors dataset
+            else:
+                # Skip JSON parsing when recall isn't needed - just return early
+                # This matches the legacy _vector_search_query_with_recall behavior
+                pass
 
             return result
 
