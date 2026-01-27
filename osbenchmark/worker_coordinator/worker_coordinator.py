@@ -2266,40 +2266,6 @@ class WorkerCoordinator:
                         errors.get("total_errors", 0),
                         errors.get("error_rate", 0) * 100)
 
-        # Print results to console (visible to user)
-        from osbenchmark.utils import console
-        console.println("")
-        console.println("=" * 60)
-        console.println("  HIGH-PERFORMANCE BENCHMARK RESULTS")
-        console.println("=" * 60)
-        console.println("")
-        console.println(f"  Throughput:    {throughput.get('qps', 0):,.2f} ops/s")
-        console.println(f"  Total Ops:     {throughput.get('total_ops', 0):,}")
-        console.println(f"  Duration:      {throughput.get('duration_s', 0):.2f} s")
-        console.println("")
-        console.println("  Latency:")
-        console.println(f"    p50:         {latency.get('p50_ms', 0):.2f} ms")
-        console.println(f"    p90:         {latency.get('p90_ms', 0):.2f} ms")
-        console.println(f"    p99:         {latency.get('p99_ms', 0):.2f} ms")
-        console.println(f"    avg:         {latency.get('avg_ms', 0):.2f} ms")
-        if recall.get("recall@k") is not None:
-            console.println("")
-            console.println("  Recall:")
-            console.println(f"    recall@{recall.get('k', k)}:   {recall.get('recall@k', 0):.4f}")
-            console.println(f"    recall@1:    {recall.get('recall@1', 0):.4f}")
-            console.println(f"    samples:     {recall.get('samples', 0):,}")
-        if service_time:
-            console.println("")
-            console.println("  Service Time (OpenSearch 'took'):")
-            console.println(f"    p50:         {service_time.get('p50_ms', 0):.2f} ms")
-            console.println(f"    p90:         {service_time.get('p90_ms', 0):.2f} ms")
-            console.println(f"    p99:         {service_time.get('p99_ms', 0):.2f} ms")
-        console.println("")
-        console.println(f"  Errors:        {errors.get('total_errors', 0)} ({errors.get('error_rate', 0) * 100:.2f}%)")
-        console.println("")
-        console.println("=" * 60)
-        console.println("")
-
         # Write metrics to metrics store for Final Score table
         # The GlobalStatsCalculator reads these using get_mean, get_percentiles, etc.
         # We need to store multiple samples so aggregation works correctly.
@@ -2309,12 +2275,9 @@ class WorkerCoordinator:
             # Use actual operation type from task - must match what GlobalStatsCalculator queries
             op_type = search_task.operation.type if hasattr(search_task.operation, 'type') else "vector-search"
 
-            self.logger.info("Storing HP metrics: task=%s, op=%s, op_type=%s", task_name, op_name, op_type)
-
             from osbenchmark.metrics import SampleType
             sample_type = SampleType.Normal
             time_series = results.get("time_series", [])
-            self.logger.info("Storing %d throughput samples from time_series", len(time_series))
 
             # Store throughput samples (one per second bucket for min/mean/median/max)
             # This allows GlobalStatsCalculator to compute aggregates
@@ -2411,24 +2374,12 @@ class WorkerCoordinator:
                 sample_type=sample_type
             )
 
-            # Debug: check how many docs are in the store
-            if hasattr(self.metrics_store, 'docs'):
-                self.logger.info("InMemoryMetricsStore has %d documents after storing HP metrics",
-                                len(self.metrics_store.docs))
-            else:
-                self.logger.info("Metrics store type: %s", type(self.metrics_store).__name__)
+            # Flush to ensure metrics are searchable before GlobalStatsCalculator queries
+            self.metrics_store.flush()
 
         # Signal completion
         self.telemetry.on_benchmark_stop()
-        # For OsMetricsStore, metrics are stored directly to OpenSearch.
-        # We need to flush to ensure they're searchable before GlobalStatsCalculator queries.
-        if self.metrics_store:
-            self.metrics_store.flush()
-            self.logger.info("Flushed metrics store to ensure data is searchable")
         final_results = self.metrics_store.to_externalizable(clear=True) if self.metrics_store else {}
-        self.logger.info("to_externalizable returned: %s (type: %s)",
-                        "data" if final_results else "None/empty",
-                        type(final_results).__name__ if final_results else "None")
         self.target.on_benchmark_complete(final_results)
 
     def start_benchmark(self):
