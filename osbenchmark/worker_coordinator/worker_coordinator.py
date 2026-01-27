@@ -1896,8 +1896,19 @@ class WorkerCoordinator:
 
         # Get search parameters
         num_clients = search_task.clients
-        index = search_task.operation.param_source_params.get("index", "target_index")
-        body = search_task.operation.param_source_params.get("body", {"query": {"match_all": {}}})
+        # Operation params are in operation.params
+        op_params = search_task.operation.params if search_task.operation.params else {}
+        # Also check task.params which might have overrides
+        task_params = search_task.params if hasattr(search_task, 'params') and search_task.params else {}
+
+        self.logger.info("Operation params: %s", op_params)
+        self.logger.info("Task params: %s", task_params)
+
+        # Merge params (task params override operation params)
+        all_params = {**op_params, **task_params}
+
+        index = all_params.get("index", "target_index")
+        body = all_params.get("body", {"query": {"match_all": {}}})
 
         # Duration from warmup-time-period or default 30s
         duration = self.config.opts("workload", "warmup.time.period", mandatory=False, default_value=30)
