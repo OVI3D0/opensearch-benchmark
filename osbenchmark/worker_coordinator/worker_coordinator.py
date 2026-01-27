@@ -305,6 +305,7 @@ class MetricsActor(actor.BenchmarkActor):
     - service_time, client_processing_time, processing_time
     - latency, time_period, relative_time
     - recall@k, recall@1 (if enabled)
+    - throughput (aggregated per 1-second buckets)
 
     This reduces the hot path from ~500 ops to ~10 ops per request.
 
@@ -313,11 +314,48 @@ class MetricsActor(actor.BenchmarkActor):
     - Wakes up every 100ms to process samples from shared queue
     - Processes up to MAX_SAMPLES_PER_CYCLE samples per wakeup
     - Writes processed samples directly to metrics store
-    - On shutdown, drains remaining samples before stopping
+    - Calculates throughput in 1-second buckets per task
+    - On shutdown, drains remaining samples and emits final throughput
     """
 
     WAKEUP_INTERVAL_SECONDS = 0.1  # Process every 100ms
     MAX_SAMPLES_PER_CYCLE = 5000   # Limit per wakeup to stay responsive
+    THROUGHPUT_BUCKET_INTERVAL = 1  # 1-second buckets for throughput
+
+    class TaskThroughputState:
+        """Tracks per-task state for throughput calculation (mirrors ThroughputCalculator.TaskStats)."""
+        def __init__(self, bucket_interval, sample_type, start_time):
+            self.total_count = 0
+            self.interval = 0
+            self.bucket_interval = bucket_interval
+            self.bucket = bucket_interval  # first bucket completes after one interval
+            self.sample_type = sample_type
+            self.has_samples_in_sample_type = False
+            self.start_time = start_time
+            self.last_sample = None  # Keep last sample for final throughput
+
+        @property
+        def throughput(self):
+            return self.total_count / self.interval if self.interval > 0 else 0
+
+        def maybe_update_sample_type(self, current_sample_type):
+            if self.sample_type < current_sample_type:
+                self.sample_type = current_sample_type
+                self.has_samples_in_sample_type = False
+
+        def update_interval(self, absolute_sample_time):
+            self.interval = max(absolute_sample_time - self.start_time, self.interval)
+
+        def can_calculate_throughput(self):
+            return self.interval > 0 and self.interval >= self.bucket
+
+        def can_add_final_throughput_sample(self):
+            return self.interval > 0 and not self.has_samples_in_sample_type
+
+        def finish_bucket(self, new_total):
+            self.total_count = new_total
+            self.has_samples_in_sample_type = True
+            self.bucket = int(self.interval) + self.bucket_interval
 
     def __init__(self):
         super().__init__()
@@ -333,6 +371,9 @@ class MetricsActor(actor.BenchmarkActor):
         self.total_samples_processed = 0
         self.sample_count = 0  # For downsampling
         self.master = None
+        # Throughput tracking per task
+        self.task_throughput_states = {}
+        self.pending_throughput_counts = {}  # counts accumulated before bucket boundary
 
     @actor.no_retry("metrics_actor")
     def receiveMsg_StartMetricsActor(self, msg, sender):
@@ -401,6 +442,13 @@ class MetricsActor(actor.BenchmarkActor):
         except queue.Empty:
             pass
 
+        # Emit final throughput for any partial buckets
+        self._emit_final_throughput()
+
+        # Flush metrics store to ensure all data is persisted
+        if self.metrics_store:
+            self.metrics_store.flush(refresh=False)
+
         # Close our metrics store connection
         if self.metrics_store and self.metrics_store.opened:
             self.metrics_store.close()
@@ -416,7 +464,8 @@ class MetricsActor(actor.BenchmarkActor):
         This is where we do everything that was previously in the hot path:
         1. Calculate timing metrics (service_time, latency, etc.)
         2. Calculate recall (if enabled and data available)
-        3. Write directly to metrics store (with downsampling)
+        3. Track and emit throughput (aggregated per 1-second buckets)
+        4. Write directly to metrics store (with downsampling)
         """
         self.sample_count += 1
 
@@ -447,6 +496,12 @@ class MetricsActor(actor.BenchmarkActor):
             neighbors = self.neighbors_dataset[raw.query_index]
             recall_k = self._calculate_recall(raw.candidate_ids, neighbors, self.k)
             recall_1 = self._calculate_recall(raw.candidate_ids, neighbors, 1)
+
+        # ============================================================
+        # DEFERRED CALCULATION 3: Throughput tracking
+        # Previously in ThroughputCalculator
+        # ============================================================
+        self._track_throughput(raw, relative_time)
 
         # ============================================================
         # Write to metrics store (with downsampling)
@@ -514,6 +569,107 @@ class MetricsActor(actor.BenchmarkActor):
         if raw.request_meta_data:
             result.update(raw.request_meta_data)
         return result
+
+    def _track_throughput(self, raw: RawSample, relative_time: float):
+        """
+        Track throughput for a sample and emit metrics when bucket boundaries are crossed.
+
+        Mirrors the algorithm in ThroughputCalculator.calculate_task_throughput().
+        Throughput is calculated in 1-second buckets per task.
+        """
+        task = raw.task
+
+        # Initialize state for this task if not seen before
+        if task not in self.task_throughput_states:
+            # Calculate start_time: absolute_time minus the time_period (relative_time)
+            # This mirrors ThroughputCalculator: start_time = first_sample.absolute_time - first_sample.time_period
+            start_time = raw.absolute_time - relative_time
+            self.task_throughput_states[task] = self.TaskThroughputState(
+                bucket_interval=self.THROUGHPUT_BUCKET_INTERVAL,
+                sample_type=raw.sample_type,
+                start_time=start_time
+            )
+            self.pending_throughput_counts[task] = 0
+
+        state = self.task_throughput_states[task]
+
+        # Update sample type if it progressed (warmup -> normal)
+        state.maybe_update_sample_type(raw.sample_type)
+
+        # Accumulate count
+        self.pending_throughput_counts[task] += raw.total_ops
+
+        # Update interval
+        state.update_interval(raw.absolute_time)
+
+        # Store last sample info for relative_time and unit
+        state.last_sample = raw
+
+        # Check if we can emit a throughput sample (bucket boundary crossed)
+        if state.can_calculate_throughput():
+            # Finalize the bucket
+            state.finish_bucket(self.pending_throughput_counts[task])
+
+            # Emit throughput metric
+            self._emit_throughput(
+                task=task,
+                absolute_time=raw.absolute_time,
+                relative_time=relative_time,
+                sample_type=state.sample_type,
+                throughput=state.throughput,
+                throughput_unit=f"{raw.total_ops_unit}/s"
+            )
+
+    def _emit_throughput(self, task, absolute_time, relative_time, sample_type, throughput, throughput_unit):
+        """Write a throughput metric to the metrics store."""
+        meta_data = {}
+        if self.workload_meta_data:
+            meta_data.update(self.workload_meta_data)
+        if self.test_procedure_meta_data:
+            meta_data.update(self.test_procedure_meta_data)
+        if task.operation and task.operation.meta_data:
+            meta_data.update(task.operation.meta_data)
+        if task.meta_data:
+            meta_data.update(task.meta_data)
+
+        self.metrics_store.put_value_cluster_level(
+            name="throughput",
+            value=throughput,
+            unit=throughput_unit,
+            task=task.name,
+            operation=task.operation.name,
+            operation_type=task.operation.type,
+            sample_type=sample_type,
+            absolute_time=absolute_time,
+            relative_time=relative_time,
+            meta_data=meta_data,
+        )
+
+    def _emit_final_throughput(self):
+        """
+        Emit final throughput for any tasks with partial buckets.
+
+        This ensures we report throughput even for short runs or tasks that
+        didn't complete a full bucket.
+        """
+        for task, state in self.task_throughput_states.items():
+            if state.can_add_final_throughput_sample() and state.last_sample is not None:
+                # Finalize with accumulated count
+                state.finish_bucket(self.pending_throughput_counts.get(task, 0))
+
+                raw = state.last_sample
+                relative_time = raw.request_start - raw.total_start if hasattr(raw, 'request_start') else 0
+
+                self._emit_throughput(
+                    task=task,
+                    absolute_time=raw.absolute_time,
+                    relative_time=relative_time,
+                    sample_type=state.sample_type,
+                    throughput=state.throughput,
+                    throughput_unit=f"{raw.total_ops_unit}/s"
+                )
+
+        self.logger.info("Emitted final throughput for %d tasks", len(self.task_throughput_states))
 
 
 def load_redline_config():
