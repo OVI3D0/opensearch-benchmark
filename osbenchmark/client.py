@@ -363,14 +363,16 @@ class UnifiedClient:
                 "gRPC SearchService not available. Please configure --grpc-target-hosts.")
 
     def __del__(self):
-        """Close all gRPC channels."""
-        for cluster_stubs in self._grpc_stubs.values():
-            if '_channel' in cluster_stubs:
-                try:
-                    cluster_stubs['_channel'].close()
-                except Exception as e:
-                    self._logger.warning("Error closing gRPC channel: %s", e)
-        self._opensearch.close()
+        """Close all gRPC channels and OpenSearch client."""
+        if self._grpc_stubs:
+            for cluster_stubs in self._grpc_stubs.values():
+                if '_channel' in cluster_stubs:
+                    try:
+                        cluster_stubs['_channel'].close()
+                    except Exception as e:
+                        self._logger.warning("Error closing gRPC channel: %s", e)
+        if self._opensearch:
+            self._opensearch.close()
 
     @property
     def opensearch(self):

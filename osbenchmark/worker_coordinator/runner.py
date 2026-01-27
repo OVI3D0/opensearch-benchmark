@@ -1596,6 +1596,8 @@ class Query(Runner):
                 - query_index: Index into neighbors dataset (for deferred recall)
                 - hits, hits_relation, timed_out, took: If detailed_results is True
             """
+            # DEBUG: Log to verify this path is being used
+            self.logger.debug("Using _vector_search_minimal (streaming metrics path)")
             def _get_field_value(content, field_name):
                 if field_name in content:
                     return content[field_name]

@@ -3114,9 +3114,10 @@ class AsyncExecutor:
             total_ops=result_data["total_ops"],
             total_ops_unit=result_data["total_ops_unit"],
 
-            # Task metadata (copied for pickling)
-            task_meta_data=dict(self.task.meta_data) if self.task.meta_data else None,
-            operation_meta_data=dict(self.task.operation.meta_data) if self.task.operation.meta_data else None,
+            # Task metadata - use reference instead of copy to reduce overhead
+            # (pickling happens later in batch, not per-sample)
+            task_meta_data=self.task.meta_data,
+            operation_meta_data=self.task.operation.meta_data,
 
             # Progress
             task_progress=progress,
