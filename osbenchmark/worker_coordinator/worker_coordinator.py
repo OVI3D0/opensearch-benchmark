@@ -2707,6 +2707,9 @@ class AsyncExecutor:
                 available_cores = int(self.cfg.opts("system", "available.cores", mandatory=False,
                                                     default_value=multiprocessing.cpu_count()))
                 params.update({"num_clients": self.task.clients, "num_cores": available_cores})
+                # When streaming metrics is enabled, defer recall calculation to MetricsActor
+                if self.streaming_metrics_enabled:
+                    params.update({"defer-recall-calculation": True})
             return context_manager
 
     async def _execute_request(self, params: dict, expected_scheduled_time: float, total_start: float,
