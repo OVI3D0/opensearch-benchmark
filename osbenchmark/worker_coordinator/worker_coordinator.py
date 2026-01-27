@@ -134,14 +134,15 @@ class StartWorker:
     """
 
     def __init__(self, worker_id, config, workload, client_allocations, feedback_actor=None, error_queue=None,
-                 queue_lock=None, shared_states=None, shared_sample_queue=None):
+                 queue_lock=None, shared_states=None, streaming_metrics_enabled=False):
         """
         :param worker_id: Unique (numeric) id of the worker.
         :param config: OSB internal configuration object.
         :param workload: The workload to use.
         :param client_allocations: A structure describing which clients need to run which tasks.
-        :param shared_sample_queue: If provided, enables streaming metrics mode. Raw samples
-                                    are queued here for async processing by MetricsActor.
+        :param streaming_metrics_enabled: If True, enables streaming metrics mode with Thespian
+                                          message passing. Workers batch RawSamples and send
+                                          UpdateRawSamples to WorkerCoordinatorActor.
         """
         self.worker_id = worker_id
         self.config = config
@@ -151,7 +152,7 @@ class StartWorker:
         self.error_queue = error_queue
         self.queue_lock = queue_lock
         self.shared_states = shared_states
-        self.shared_sample_queue = shared_sample_queue
+        self.streaming_metrics_enabled = streaming_metrics_enabled
 
 
 class Drive:
@@ -232,6 +233,9 @@ class RawSample:
 
     Size: ~200 bytes vs ~500+ bytes for DefaultSample
     Construction: ~10 ops vs ~50+ ops for DefaultSample
+
+    IMPORTANT: Stores task identifiers as strings instead of Task object
+    to minimize pickle overhead when sent via Thespian message passing.
     """
     # Raw timestamps (MUST capture at request time)
     absolute_time: float          # time.time() - wall clock for metrics store
@@ -247,12 +251,18 @@ class RawSample:
     expected_scheduled_time: float  # for latency calculation
     throughput_throttled: bool    # affects latency calculation
 
-    # Task metadata (references, not copies)
-    task: Any                     # Task object reference
+    # Task identifiers (STRINGS for efficient pickling - NOT Task object)
+    task_name: str                # task.name
+    operation_name: str           # task.operation.name
+    operation_type: str           # task.operation.type
     client_id: int
     sample_type: str
     total_ops: int
     total_ops_unit: str
+
+    # Task metadata (copied, not referenced - for pickling)
+    task_meta_data: Optional[dict] = None       # task.meta_data
+    operation_meta_data: Optional[dict] = None  # task.operation.meta_data
 
     # Progress tracking
     task_progress: Optional[float] = None
@@ -269,15 +279,64 @@ class RawSample:
     is_profile_sample: bool = False
 
 
+class RawSampler:
+    """
+    Collects RawSample objects for streaming metrics mode.
+    Similar to DefaultSampler but without any calculations.
+
+    Samples are batched locally and sent via Thespian message passing
+    to WorkerCoordinatorActor, which forwards them to MetricsActor.
+    """
+    def __init__(self, client_id: int, task, buffer_size: int = 16384):
+        self.client_id = client_id
+        self.task = task  # Keep reference for creating RawSamples
+        self.samples: List[RawSample] = []
+        self.buffer_size = buffer_size
+
+    def add(self, raw_sample: RawSample):
+        """Add a raw sample to the local buffer. No calculations."""
+        if len(self.samples) < self.buffer_size:
+            self.samples.append(raw_sample)
+
+    @property
+    def current_samples(self) -> List[RawSample]:
+        """Return current samples and clear buffer for next batch."""
+        samples = self.samples
+        self.samples = []
+        return samples
+
+
+class UpdateRawSamples:
+    """
+    Sent from Worker to WorkerCoordinatorActor with batched raw samples.
+    Uses Thespian message passing (efficient TCP transport with batching).
+    """
+    def __init__(self, client_id: int, samples: List[RawSample]):
+        self.client_id = client_id
+        self.samples = samples
+
+
+class ProcessRawSamples:
+    """
+    Sent from WorkerCoordinatorActor to MetricsActor for processing.
+    MetricsActor processes the batch immediately (no accumulation).
+    """
+    def __init__(self, samples: List[RawSample]):
+        self.samples = samples
+
+
 class StartMetricsActor:
     """Message to initialize MetricsActor.
 
     Passes config instead of metrics_store because metrics_store contains SSLContext
     which cannot be pickled. MetricsActor creates its own metrics store connection.
+
+    Note: sample_queue is kept for backward compatibility but is no longer used
+    in the Thespian message passing architecture (v2).
     """
-    def __init__(self, sample_queue, config, workload_meta_data, test_procedure_meta_data,
-                 downsample_factor, neighbors_dataset=None, k=None):
-        self.sample_queue = sample_queue
+    def __init__(self, config, workload_meta_data, test_procedure_meta_data,
+                 downsample_factor, neighbors_dataset=None, k=None, sample_queue=None):
+        self.sample_queue = sample_queue  # Deprecated - kept for compatibility
         self.config = config  # Serialized config - MetricsActor will create its own metrics store
         self.workload_meta_data = workload_meta_data
         self.test_procedure_meta_data = test_procedure_meta_data
@@ -309,17 +368,15 @@ class MetricsActor(actor.BenchmarkActor):
 
     This reduces the hot path from ~500 ops to ~10 ops per request.
 
-    Processing model:
+    Processing model (v2 - Thespian message passing):
     - Creates its own metrics store connection (avoids pickle issues)
-    - Wakes up every 100ms to process samples from shared queue
-    - Processes up to MAX_SAMPLES_PER_CYCLE samples per wakeup
+    - Receives sample batches via ProcessRawSamples messages from WorkerCoordinatorActor
+    - Processes batches immediately as they arrive (no accumulation)
     - Writes processed samples directly to metrics store
     - Calculates throughput in 1-second buckets per task
-    - On shutdown, drains remaining samples and emits final throughput
+    - On shutdown, emits final throughput for partial buckets
     """
 
-    WAKEUP_INTERVAL_SECONDS = 0.1  # Process every 100ms
-    MAX_SAMPLES_PER_CYCLE = 5000   # Limit per wakeup to stay responsive
     THROUGHPUT_BUCKET_INTERVAL = 1  # 1-second buckets for throughput
 
     class TaskThroughputState:
@@ -360,7 +417,6 @@ class MetricsActor(actor.BenchmarkActor):
     def __init__(self):
         super().__init__()
         self.logger = logging.getLogger(__name__)
-        self.sample_queue = None
         self.metrics_store = None
         self.workload_meta_data = None
         self.test_procedure_meta_data = None
@@ -371,7 +427,7 @@ class MetricsActor(actor.BenchmarkActor):
         self.total_samples_processed = 0
         self.sample_count = 0  # For downsampling
         self.master = None
-        # Throughput tracking per task
+        # Throughput tracking per task (keyed by task_name)
         self.task_throughput_states = {}
         self.pending_throughput_counts = {}  # counts accumulated before bucket boundary
 
@@ -379,7 +435,6 @@ class MetricsActor(actor.BenchmarkActor):
     def receiveMsg_StartMetricsActor(self, msg, sender):
         """Initialize the metrics actor with required dependencies."""
         self.master = sender
-        self.sample_queue = msg.sample_queue
         self.downsample_factor = msg.downsample_factor
         self.neighbors_dataset = msg.neighbors_dataset
         self.k = msg.k
@@ -399,48 +454,32 @@ class MetricsActor(actor.BenchmarkActor):
         )
 
         self.running = True
-        self.wakeupAfter(datetime.timedelta(seconds=self.WAKEUP_INTERVAL_SECONDS))
-        self.logger.info("MetricsActor started - streaming mode with own metrics store connection")
+        self.logger.info("MetricsActor started - Thespian message passing mode")
 
     @actor.no_retry("metrics_actor")
-    def receiveMsg_WakeupMessage(self, msg, sender):
-        """Process samples from queue on each wakeup."""
+    def receiveMsg_ProcessRawSamples(self, msg, sender):
+        """
+        Process a batch of raw samples received from WorkerCoordinatorActor.
+
+        This is the main processing entry point in v2 architecture.
+        Batches arrive via Thespian message passing (efficient TCP transport).
+        """
         if not self.running:
+            self.logger.warning("MetricsActor not running, dropping %d samples", len(msg.samples))
             return
 
-        samples_this_cycle = 0
-
         try:
-            while samples_this_cycle < self.MAX_SAMPLES_PER_CYCLE:
-                try:
-                    raw_sample = self.sample_queue.get_nowait()
-                    self._process_raw_sample(raw_sample)
-                    samples_this_cycle += 1
-                    self.total_samples_processed += 1
-                except queue.Empty:
-                    break
+            for raw_sample in msg.samples:
+                self._process_raw_sample(raw_sample)
+                self.total_samples_processed += 1
         except Exception as e:
-            self.logger.error("Error processing samples: %s", e, exc_info=True)
-
-        # Schedule next wakeup
-        self.wakeupAfter(datetime.timedelta(seconds=self.WAKEUP_INTERVAL_SECONDS))
+            self.logger.error("Error processing sample batch: %s", e, exc_info=True)
 
     @actor.no_retry("metrics_actor")
     def receiveMsg_StopMetricsActor(self, msg, sender):
-        """Stop processing and drain remaining samples."""
-        self.logger.info("MetricsActor stopping, draining remaining samples...")
+        """Stop processing and emit final throughput."""
+        self.logger.info("MetricsActor stopping...")
         self.running = False
-
-        # Drain and process ALL remaining samples
-        drained = 0
-        try:
-            while True:
-                raw_sample = self.sample_queue.get_nowait()
-                self._process_raw_sample(raw_sample)
-                drained += 1
-                self.total_samples_processed += 1
-        except queue.Empty:
-            pass
 
         # Emit final throughput for any partial buckets
         self._emit_final_throughput()
@@ -453,8 +492,8 @@ class MetricsActor(actor.BenchmarkActor):
         if self.metrics_store and self.metrics_store.opened:
             self.metrics_store.close()
 
-        self.logger.info("MetricsActor stopped. Drained %d samples. Total processed: %d",
-                        drained, self.total_samples_processed)
+        self.logger.info("MetricsActor stopped. Total samples processed: %d",
+                        self.total_samples_processed)
         self.send(sender, MetricsActorStopped(self.total_samples_processed))
 
     def _process_raw_sample(self, raw: RawSample):
@@ -513,28 +552,28 @@ class MetricsActor(actor.BenchmarkActor):
                 meta_data["recall@k"] = recall_k
                 meta_data["recall@1"] = recall_1
 
-            # Write latency metric
+            # Write latency metric (using string fields from RawSample)
             self.metrics_store.put_value_cluster_level(
                 name="latency",
                 value=convert.seconds_to_ms(latency),
                 unit="ms",
-                task=raw.task.name,
-                operation=raw.task.operation.name,
-                operation_type=raw.task.operation.type,
+                task=raw.task_name,
+                operation=raw.operation_name,
+                operation_type=raw.operation_type,
                 sample_type=raw.sample_type,
                 absolute_time=raw.absolute_time,
                 relative_time=relative_time,
                 meta_data=meta_data,
             )
 
-            # Write service_time metric
+            # Write service_time metric (using string fields from RawSample)
             self.metrics_store.put_value_cluster_level(
                 name="service_time",
                 value=convert.seconds_to_ms(service_time),
                 unit="ms",
-                task=raw.task.name,
-                operation=raw.task.operation.name,
-                operation_type=raw.task.operation.type,
+                task=raw.task_name,
+                operation=raw.operation_name,
+                operation_type=raw.operation_type,
                 sample_type=raw.sample_type,
                 absolute_time=raw.absolute_time,
                 relative_time=relative_time,
@@ -556,16 +595,16 @@ class MetricsActor(actor.BenchmarkActor):
         return correct / len(truth_set)
 
     def _merge_metadata(self, raw: RawSample) -> dict:
-        """Merge all metadata sources."""
+        """Merge all metadata sources (using copied dicts from RawSample, not Task object)."""
         result = {}
         if self.workload_meta_data:
             result.update(self.workload_meta_data)
         if self.test_procedure_meta_data:
             result.update(self.test_procedure_meta_data)
-        if raw.task and raw.task.operation and raw.task.operation.meta_data:
-            result.update(raw.task.operation.meta_data)
-        if raw.task and raw.task.meta_data:
-            result.update(raw.task.meta_data)
+        if raw.operation_meta_data:
+            result.update(raw.operation_meta_data)
+        if raw.task_meta_data:
+            result.update(raw.task_meta_data)
         if raw.request_meta_data:
             result.update(raw.request_meta_data)
         return result
@@ -576,28 +615,30 @@ class MetricsActor(actor.BenchmarkActor):
 
         Mirrors the algorithm in ThroughputCalculator.calculate_task_throughput().
         Throughput is calculated in 1-second buckets per task.
+
+        Uses task_name (string) as key instead of Task object for efficient pickling.
         """
-        task = raw.task
+        task_key = raw.task_name  # Use string key instead of Task object
 
         # Initialize state for this task if not seen before
-        if task not in self.task_throughput_states:
+        if task_key not in self.task_throughput_states:
             # Calculate start_time: absolute_time minus the time_period (relative_time)
             # This mirrors ThroughputCalculator: start_time = first_sample.absolute_time - first_sample.time_period
             start_time = raw.absolute_time - relative_time
-            self.task_throughput_states[task] = self.TaskThroughputState(
+            self.task_throughput_states[task_key] = self.TaskThroughputState(
                 bucket_interval=self.THROUGHPUT_BUCKET_INTERVAL,
                 sample_type=raw.sample_type,
                 start_time=start_time
             )
-            self.pending_throughput_counts[task] = 0
+            self.pending_throughput_counts[task_key] = 0
 
-        state = self.task_throughput_states[task]
+        state = self.task_throughput_states[task_key]
 
         # Update sample type if it progressed (warmup -> normal)
         state.maybe_update_sample_type(raw.sample_type)
 
         # Accumulate count
-        self.pending_throughput_counts[task] += raw.total_ops
+        self.pending_throughput_counts[task_key] += raw.total_ops
 
         # Update interval
         state.update_interval(raw.absolute_time)
@@ -608,11 +649,11 @@ class MetricsActor(actor.BenchmarkActor):
         # Check if we can emit a throughput sample (bucket boundary crossed)
         if state.can_calculate_throughput():
             # Finalize the bucket
-            state.finish_bucket(self.pending_throughput_counts[task])
+            state.finish_bucket(self.pending_throughput_counts[task_key])
 
-            # Emit throughput metric
+            # Emit throughput metric (pass raw sample for string fields)
             self._emit_throughput(
-                task=task,
+                raw=raw,
                 absolute_time=raw.absolute_time,
                 relative_time=relative_time,
                 sample_type=state.sample_type,
@@ -620,25 +661,25 @@ class MetricsActor(actor.BenchmarkActor):
                 throughput_unit=f"{raw.total_ops_unit}/s"
             )
 
-    def _emit_throughput(self, task, absolute_time, relative_time, sample_type, throughput, throughput_unit):
-        """Write a throughput metric to the metrics store."""
+    def _emit_throughput(self, raw: RawSample, absolute_time, relative_time, sample_type, throughput, throughput_unit):
+        """Write a throughput metric to the metrics store (using RawSample string fields)."""
         meta_data = {}
         if self.workload_meta_data:
             meta_data.update(self.workload_meta_data)
         if self.test_procedure_meta_data:
             meta_data.update(self.test_procedure_meta_data)
-        if task.operation and task.operation.meta_data:
-            meta_data.update(task.operation.meta_data)
-        if task.meta_data:
-            meta_data.update(task.meta_data)
+        if raw.operation_meta_data:
+            meta_data.update(raw.operation_meta_data)
+        if raw.task_meta_data:
+            meta_data.update(raw.task_meta_data)
 
         self.metrics_store.put_value_cluster_level(
             name="throughput",
             value=throughput,
             unit=throughput_unit,
-            task=task.name,
-            operation=task.operation.name,
-            operation_type=task.operation.type,
+            task=raw.task_name,
+            operation=raw.operation_name,
+            operation_type=raw.operation_type,
             sample_type=sample_type,
             absolute_time=absolute_time,
             relative_time=relative_time,
@@ -652,16 +693,16 @@ class MetricsActor(actor.BenchmarkActor):
         This ensures we report throughput even for short runs or tasks that
         didn't complete a full bucket.
         """
-        for task, state in self.task_throughput_states.items():
+        for task_key, state in self.task_throughput_states.items():
             if state.can_add_final_throughput_sample() and state.last_sample is not None:
                 # Finalize with accumulated count
-                state.finish_bucket(self.pending_throughput_counts.get(task, 0))
+                state.finish_bucket(self.pending_throughput_counts.get(task_key, 0))
 
                 raw = state.last_sample
-                relative_time = raw.request_start - raw.total_start if hasattr(raw, 'request_start') else 0
+                relative_time = raw.request_start - raw.total_start
 
                 self._emit_throughput(
-                    task=task,
+                    raw=raw,
                     absolute_time=raw.absolute_time,
                     relative_time=relative_time,
                     sample_type=state.sample_type,
@@ -1115,11 +1156,10 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
     def receiveMsg_StartBenchmark(self, msg, sender):
         self.start_sender = sender
 
-        # Start MetricsActor if streaming metrics mode is enabled
+        # Start MetricsActor if streaming metrics mode is enabled (v2 Thespian architecture)
         if self.coordinator.streaming_metrics_enabled:
             self.metrics_actor = self.createActor(MetricsActor)
             self.send(self.metrics_actor, StartMetricsActor(
-                sample_queue=self.coordinator.shared_sample_queue,
                 config=self.coordinator.config,  # Pass config - MetricsActor creates its own metrics store
                 workload_meta_data=self.coordinator.workload.meta_data if self.coordinator.workload else None,
                 test_procedure_meta_data=self.coordinator.test_procedure.meta_data if self.coordinator.test_procedure else None,
@@ -1128,7 +1168,7 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
                 neighbors_dataset=None,  # Will be set by workload params if needed
                 k=None  # Will be set by workload params if needed
             ))
-            self.logger.info("MetricsActor started for streaming metrics processing")
+            self.logger.info("MetricsActor started for streaming metrics (Thespian message passing)")
 
         self.coordinator.start_benchmark()
         self.wakeupAfter(datetime.timedelta(seconds=WorkerCoordinatorActor.WAKEUP_INTERVAL_SECONDS))
@@ -1148,6 +1188,20 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         self.coordinator.update_profile_samples(msg.profile_samples)
 
     @actor.no_retry("worker_coordinator")  # pylint: disable=no-value-for-parameter
+    def receiveMsg_UpdateRawSamples(self, msg, sender):
+        """
+        Forward raw samples to MetricsActor for processing (v2 Thespian architecture).
+
+        This is called when streaming metrics is enabled. Workers batch RawSamples
+        and send them via Thespian message passing. We forward immediately to
+        MetricsActor - no accumulation, no 30-second batching.
+        """
+        if self.metrics_actor:
+            self.send(self.metrics_actor, ProcessRawSamples(msg.samples))
+        else:
+            self.logger.warning("Received UpdateRawSamples but MetricsActor not running")
+
+    @actor.no_retry("worker_coordinator")  # pylint: disable=no-value-for-parameter
     def receiveMsg_WakeupMessage(self, msg, sender):
         if msg.payload == WorkerCoordinatorActor.RESET_RELATIVE_TIME_MARKER:
             self.coordinator.reset_relative_time()
@@ -1163,9 +1217,9 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
         return self.createActor(Worker, targetActorRequirements=self._requirements(host))
 
     def start_worker(self, worker_coordinator, worker_id, cfg, workload, allocations, error_queue=None, queue_lock=None,
-                     shared_states=None, shared_sample_queue=None):
+                     shared_states=None, streaming_metrics_enabled=False):
         self.send(worker_coordinator, StartWorker(worker_id, cfg, workload, allocations, self.feedback_actor, error_queue,
-                                                  queue_lock, shared_states, shared_sample_queue))
+                                                  queue_lock, shared_states, streaming_metrics_enabled))
 
     def start_feedbackActor(self, shared_states):
         self.send(
@@ -1445,22 +1499,15 @@ class WorkerCoordinator:
         self.sample_post_processor = None
         self.profile_metrics_post_processor = None
 
-        # Streaming metrics infrastructure
-        # Streaming metrics mode - enabled by default for better performance
-        # Defers metric calculations to MetricsActor, reducing hot path overhead
+        # Streaming metrics infrastructure (v2 - Thespian message passing)
+        # Enabled by default for better performance. Defers metric calculations to MetricsActor.
+        # Workers batch RawSamples locally and send via Thespian (no Manager().Queue()).
         self.streaming_metrics_enabled = self.config.opts(
             "worker_coordinator", "streaming.metrics.enabled",
             mandatory=False, default_value=True
         )
         if self.streaming_metrics_enabled:
-            max_queue_size = int(self.config.opts(
-                "worker_coordinator", "streaming.metrics.max_queue_size",
-                mandatory=False, default_value=100000
-            ))
-            self.shared_sample_queue = self.manager.Queue(maxsize=max_queue_size)
-            self.logger.info("Streaming metrics mode enabled with max queue size [%d]", max_queue_size)
-        else:
-            self.shared_sample_queue = None
+            self.logger.info("Streaming metrics mode enabled (Thespian message passing)")
 
         self.number_of_steps = 0
         self.currently_completed = 0
@@ -1647,10 +1694,10 @@ class WorkerCoordinator:
                         # and send it along with the start_worker message. This way, the worker can pass it down to its assigned clients
                         self.target.start_worker(worker, worker_id, self.config, self.workload, client_allocations,
                                                  self.error_queue, self.queue_lock, shared_states=self.shared_client_dict[worker_id],
-                                                 shared_sample_queue=self.shared_sample_queue)
+                                                 streaming_metrics_enabled=self.streaming_metrics_enabled)
                     else:
                         self.target.start_worker(worker, worker_id, self.config, self.workload, client_allocations,
-                                                 shared_sample_queue=self.shared_sample_queue)
+                                                 streaming_metrics_enabled=self.streaming_metrics_enabled)
                     self.workers.append(worker)
                     worker_id += 1
         if redline_enabled:
@@ -2165,6 +2212,7 @@ class Worker(actor.BenchmarkActor):
         self.complete = threading.Event()
         self.executor_future = None
         self.sampler = None
+        self.raw_sampler = None  # For streaming metrics mode (v2 Thespian)
         self.start_driving = False
         self.wakeup_interval = Worker.WAKEUP_INTERVAL_SECONDS
         self.sample_queue_size = None
@@ -2172,7 +2220,7 @@ class Worker(actor.BenchmarkActor):
         self.feedback_actor = None
         self.error_queue = None
         self.queue_lock = None
-        self.shared_sample_queue = None  # For streaming metrics mode
+        self.streaming_metrics_enabled = False  # For streaming metrics mode (v2 Thespian)
 
     @actor.no_retry("worker")  # pylint: disable=no-value-for-parameter
     def receiveMsg_StartWorker(self, msg, sender):
@@ -2191,7 +2239,7 @@ class Worker(actor.BenchmarkActor):
         self.shared_states = msg.shared_states
         self.error_queue = msg.error_queue
         self.queue_lock = msg.queue_lock
-        self.shared_sample_queue = msg.shared_sample_queue  # For streaming metrics mode
+        self.streaming_metrics_enabled = msg.streaming_metrics_enabled  # For streaming metrics mode (v2 Thespian)
         # we need to wake up more often in test mode
         if self.config.opts("workload", "test.mode.enabled"):
             self.wakeup_interval = 0.5
@@ -2308,6 +2356,7 @@ class Worker(actor.BenchmarkActor):
             self.complete.clear()
             self.executor_future = None
             self.sampler = None
+            self.raw_sampler = None  # Reset for streaming metrics
             self.send(self.master, JoinPointReached(self.worker_id, task_allocations))
         else:
             # There may be a situation where there are more (parallel) tasks than workers. If we were asked to complete all tasks, we not
@@ -2319,9 +2368,15 @@ class Worker(actor.BenchmarkActor):
                 self.logger.info("Worker[%d] is executing tasks at index [%d].", self.worker_id, self.current_task_index)
                 self.sampler = DefaultSampler(start_timestamp=time.perf_counter(), buffer_size=self.sample_queue_size)
                 self.profile_sampler = ProfileMetricsSampler(start_timestamp=time.perf_counter(), buffer_size=self.sample_queue_size)
+
+                # Create RawSampler for streaming metrics mode (v2 Thespian)
+                if self.streaming_metrics_enabled:
+                    self.raw_sampler = RawSampler(client_id=self.worker_id, task=None, buffer_size=self.sample_queue_size)
+
                 executor = AsyncIoAdapter(self.config, self.workload, task_allocations, self.sampler, self.profile_sampler,
                                           self.cancel, self.complete, self.on_error, self.shared_states, self.feedback_actor,
-                                          self.error_queue, self.queue_lock, self.shared_sample_queue)
+                                          self.error_queue, self.queue_lock,
+                                          raw_sampler=self.raw_sampler, streaming_metrics_enabled=self.streaming_metrics_enabled)
 
                 self.executor_future = self.pool.submit(executor)
                 self.wakeupAfter(datetime.timedelta(seconds=self.wakeup_interval))
@@ -2337,6 +2392,13 @@ class Worker(actor.BenchmarkActor):
         return current
 
     def send_samples(self):
+        # Send raw samples for streaming metrics mode (v2 Thespian)
+        if self.raw_sampler and self.streaming_metrics_enabled:
+            raw_samples = self.raw_sampler.current_samples
+            if len(raw_samples) > 0:
+                self.send(self.master, UpdateRawSamples(self.worker_id, raw_samples))
+
+        # Send regular samples (legacy path or when streaming disabled)
         if self.sampler:
             samples = self.sampler.samples
             if len(samples) > 0:
@@ -2635,7 +2697,7 @@ class ThroughputCalculator:
 class AsyncIoAdapter:
     def __init__(self, cfg, workload, task_allocations, sampler, profile_sampler, cancel, complete, abort_on_error,
                  shared_states=None, feedback_actor=None, error_queue=None, queue_lock=None,
-                 shared_sample_queue=None):
+                 raw_sampler=None, streaming_metrics_enabled=False):
         self.cfg = cfg
         self.workload = workload
         self.task_allocations = task_allocations
@@ -2652,7 +2714,9 @@ class AsyncIoAdapter:
         self.feedback_actor = feedback_actor
         self.error_queue = error_queue
         self.queue_lock = queue_lock
-        self.shared_sample_queue = shared_sample_queue
+        # Streaming metrics (v2 Thespian)
+        self.raw_sampler = raw_sampler
+        self.streaming_metrics_enabled = streaming_metrics_enabled
 
     def __call__(self, *args, **kwargs):
         # only possible in Python 3.7+ (has introduced get_running_loop)
@@ -2722,7 +2786,7 @@ class AsyncIoAdapter:
             async_executor = AsyncExecutor(
                 client_id, task, schedule, opensearch, self.sampler, self.profile_sampler, self.cancel, self.complete,
                 task.error_behavior(self.abort_on_error), self.cfg, self.shared_states, self.feedback_actor, self.error_queue, self.queue_lock,
-                shared_sample_queue=self.shared_sample_queue)
+                raw_sampler=self.raw_sampler, streaming_metrics_enabled=self.streaming_metrics_enabled)
             final_executor = AsyncProfiler(async_executor) if self.profiling_enabled else async_executor
             aws.append(final_executor())
         run_start = time.perf_counter()
@@ -2776,14 +2840,14 @@ class AsyncProfiler:
 class AsyncExecutor:
     def __init__(self, client_id, task, schedule, opensearch, sampler, profile_sampler, cancel, complete, on_error,
                  config=None, shared_states=None, feedback_actor=None, error_queue=None, queue_lock=None,
-                 shared_sample_queue=None):
+                 raw_sampler=None, streaming_metrics_enabled=False):
         """
         Executes tasks according to the schedule for a given operation.
 
         Args:
-            shared_sample_queue: If provided, enables streaming metrics mode. Raw samples
-                                 are queued here for async processing by MetricsActor instead
-                                 of being processed inline.
+            raw_sampler: RawSampler instance for streaming metrics mode (v2 Thespian).
+                        Raw samples are added here for batched sending to MetricsActor.
+            streaming_metrics_enabled: If True, use streaming metrics path with RawSampler.
         """
         self.client_id = client_id
         self.task = task
@@ -2804,9 +2868,9 @@ class AsyncExecutor:
         self.queue_lock = queue_lock
         self.redline_enabled = self.cfg.opts("workload", "redline.test", mandatory=False) if self.cfg else False
 
-        # Streaming metrics infrastructure
-        self.shared_sample_queue = shared_sample_queue
-        self.streaming_metrics_enabled = shared_sample_queue is not None
+        # Streaming metrics infrastructure (v2 Thespian message passing)
+        self.raw_sampler = raw_sampler
+        self.streaming_metrics_enabled = streaming_metrics_enabled
 
         # Client options are fetched once during initialization, not on every request.
         self.client_options = self._get_client_options()
@@ -3023,9 +3087,9 @@ class AsyncExecutor:
     def _queue_raw_sample(self, result_data: dict, total_start: float, progress: float,
                           is_profile_sample: bool = False) -> None:
         """
-        Queue a minimal RawSample for async processing by MetricsActor.
+        Add a minimal RawSample to the raw_sampler for batched sending to MetricsActor.
 
-        This is the streaming metrics hot path - NO calculations here.
+        This is the streaming metrics hot path (v2 Thespian) - NO calculations here.
         All metric calculations are deferred to MetricsActor.
 
         Operations: ~10 (vs ~50+ in legacy path)
@@ -3045,12 +3109,18 @@ class AsyncExecutor:
             expected_scheduled_time=self.expected_scheduled_time,
             throughput_throttled=result_data["throughput_throttled"],
 
-            # Task metadata (references)
-            task=self.task,
+            # Task identifiers (STRINGS for efficient pickling - NOT Task object)
+            task_name=self.task.name,
+            operation_name=self.task.operation.name,
+            operation_type=self.task.operation.type,
             client_id=self.client_id,
             sample_type=self.sample_type,
             total_ops=result_data["total_ops"],
             total_ops_unit=result_data["total_ops_unit"],
+
+            # Task metadata (copied for pickling)
+            task_meta_data=dict(self.task.meta_data) if self.task.meta_data else None,
+            operation_meta_data=dict(self.task.operation.meta_data) if self.task.operation.meta_data else None,
 
             # Progress
             task_progress=progress,
@@ -3067,10 +3137,9 @@ class AsyncExecutor:
             is_profile_sample=is_profile_sample,
         )
 
-        try:
-            self.shared_sample_queue.put_nowait(raw_sample)
-        except queue.Full:
-            self.logger.warning("Sample queue full; dropping sample for [%s]", self.task.operation.name)
+        # Add to raw_sampler for batched sending (v2 Thespian)
+        if self.raw_sampler:
+            self.raw_sampler.add(raw_sample)
 
     async def _cleanup(self) -> None:
         """Clean up resources after task execution."""
