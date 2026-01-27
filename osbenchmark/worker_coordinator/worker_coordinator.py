@@ -2309,9 +2309,12 @@ class WorkerCoordinator:
             # Use actual operation type from task - must match what GlobalStatsCalculator queries
             op_type = search_task.operation.type if hasattr(search_task.operation, 'type') else "vector-search"
 
+            self.logger.info("Storing HP metrics: task=%s, op=%s, op_type=%s", task_name, op_name, op_type)
+
             from osbenchmark.metrics import SampleType
             sample_type = SampleType.Normal
             time_series = results.get("time_series", [])
+            self.logger.info("Storing %d throughput samples from time_series", len(time_series))
 
             # Store throughput samples (one per second bucket for min/mean/median/max)
             # This allows GlobalStatsCalculator to compute aggregates
@@ -2408,9 +2411,19 @@ class WorkerCoordinator:
                 sample_type=sample_type
             )
 
+            # Debug: check how many docs are in the store
+            if hasattr(self.metrics_store, 'docs'):
+                self.logger.info("InMemoryMetricsStore has %d documents after storing HP metrics",
+                                len(self.metrics_store.docs))
+            else:
+                self.logger.info("Metrics store type: %s", type(self.metrics_store).__name__)
+
         # Signal completion
         self.telemetry.on_benchmark_stop()
         final_results = self.metrics_store.to_externalizable(clear=True) if self.metrics_store else {}
+        self.logger.info("to_externalizable returned: %s (type: %s)",
+                        "data" if final_results else "None/empty",
+                        type(final_results).__name__ if final_results else "None")
         self.target.on_benchmark_complete(final_results)
 
     def start_benchmark(self):

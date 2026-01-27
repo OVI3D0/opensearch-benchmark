@@ -256,8 +256,14 @@ class BenchmarkCoordinator:
 
     def on_benchmark_complete(self, new_metrics):
         self.logger.info("OSB is complete.")
-        self.logger.info("Bulk adding request metrics to metrics store.")
+        self.logger.info("Bulk adding request metrics to metrics store. Received: %s (type: %s, size: %d bytes)",
+                        "data" if new_metrics else "None/empty",
+                        type(new_metrics).__name__ if new_metrics else "None",
+                        len(new_metrics) if new_metrics else 0)
         self.metrics_store.bulk_add(new_metrics)
+        # Debug: check how many docs after bulk_add
+        if hasattr(self.metrics_store, 'docs'):
+            self.logger.info("After bulk_add, metrics store has %d documents", len(self.metrics_store.docs))
         self.metrics_store.flush()
         if not self.cancelled and not self.error:
             final_results = metrics.calculate_results(self.metrics_store, self.test_run)
