@@ -396,6 +396,7 @@ class MetricsProcessor:
             "time_series": time_series,
             "service_time": service_time,
             "total_queries": len(all_results),
+            "_worker_results": worker_results,  # Include raw results for metrics storage
         }
 
     def _calc_throughput(self, worker_results, all_results) -> dict:
@@ -562,7 +563,7 @@ class HighPerformanceExecutor:
         self.logger = logging.getLogger(__name__)
 
     def run(self, num_clients, duration, index, body, k=100,
-            neighbors=None, id_field="_id", num_queries=None):
+            neighbors=None, id_field="_id", num_queries=None, quiet=False):
         """
         Run high-performance benchmark with full metrics.
 
@@ -575,15 +576,22 @@ class HighPerformanceExecutor:
             neighbors: Ground truth - list of [id1, id2, ...] per query
             id_field: Field name containing document IDs
             num_queries: Number of unique queries (for cycling)
+            quiet: If True, suppress progress output
 
         Returns:
             dict with full metrics from MetricsProcessor
         """
+        from osbenchmark.utils import console
+
         self.logger.info("Starting high-performance execution with %d clients for %d seconds",
                         num_clients, duration)
 
         # Use 'spawn' context for clean process isolation (like VDBBench)
         mp_context = multiprocessing.get_context('spawn')
+
+        # Progress indicator
+        progress_publisher = console.progress() if not quiet else None
+        task_name = f"vector-search ({num_clients} clients)"
 
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=num_clients,
@@ -604,6 +612,26 @@ class HighPerformanceExecutor:
                 )
                 for i in range(num_clients)
             ]
+
+            # Show progress while waiting for results
+            start_time = time.perf_counter()
+            all_done = False
+            while not all_done:
+                # Check if any futures are still running
+                done_count = sum(1 for f in futures if f.done())
+                all_done = done_count == len(futures)
+
+                if not all_done:
+                    # Show time-based progress
+                    elapsed = time.perf_counter() - start_time
+                    progress_pct = min(100, int((elapsed / duration) * 100))
+                    if progress_publisher:
+                        progress_publisher.print(f"Running {task_name}", f"[{progress_pct:3d}% done]")
+                    time.sleep(0.5)
+
+            if progress_publisher:
+                progress_publisher.print(f"Running {task_name}", "[100% done]")
+                progress_publisher.finish()
 
             # Collect results
             worker_results = [f.result() for f in futures]
@@ -2149,7 +2177,8 @@ class WorkerCoordinator:
         index = all_params.get("index", "target_index")
         body = all_params.get("body", {"query": {"match_all": {}}})
         k = all_params.get("k", 100)
-        id_field = all_params.get("id-field-name", "_id")
+        # Handle empty string as well as missing key
+        id_field = all_params.get("id-field-name") or "_id"
 
         # Duration from warmup-time-period or default 30s
         duration = self.config.opts("workload", "warmup.time.period", mandatory=False, default_value=30)
@@ -2157,8 +2186,9 @@ class WorkerCoordinator:
         # Load ground truth neighbors for recall calculation
         neighbors = None
         num_queries = None
-        neighbors_path = all_params.get("neighbors_data_set_path")
-        neighbors_format = all_params.get("neighbors_data_set_format", "hdf5")
+        # Handle empty strings as well as missing keys
+        neighbors_path = all_params.get("neighbors_data_set_path") or None
+        neighbors_format = all_params.get("neighbors_data_set_format") or "hdf5"
 
         if neighbors_path:
             self.logger.info("Loading ground truth neighbors from: %s", neighbors_path)
@@ -2200,6 +2230,7 @@ class WorkerCoordinator:
             neighbors=neighbors,
             id_field=id_field,
             num_queries=num_queries,
+            quiet=self.quiet,
         )
 
         # Extract metrics for logging and storage
@@ -2235,48 +2266,115 @@ class WorkerCoordinator:
                         errors.get("total_errors", 0),
                         errors.get("error_rate", 0) * 100)
 
-        # Write metrics to metrics store
+        # Print results to console (visible to user)
+        from osbenchmark.utils import console
+        console.println("")
+        console.println("=" * 60)
+        console.println("  HIGH-PERFORMANCE BENCHMARK RESULTS")
+        console.println("=" * 60)
+        console.println("")
+        console.println(f"  Throughput:    {throughput.get('qps', 0):,.2f} ops/s")
+        console.println(f"  Total Ops:     {throughput.get('total_ops', 0):,}")
+        console.println(f"  Duration:      {throughput.get('duration_s', 0):.2f} s")
+        console.println("")
+        console.println("  Latency:")
+        console.println(f"    p50:         {latency.get('p50_ms', 0):.2f} ms")
+        console.println(f"    p90:         {latency.get('p90_ms', 0):.2f} ms")
+        console.println(f"    p99:         {latency.get('p99_ms', 0):.2f} ms")
+        console.println(f"    avg:         {latency.get('avg_ms', 0):.2f} ms")
+        if recall.get("recall@k") is not None:
+            console.println("")
+            console.println("  Recall:")
+            console.println(f"    recall@{recall.get('k', k)}:   {recall.get('recall@k', 0):.4f}")
+            console.println(f"    recall@1:    {recall.get('recall@1', 0):.4f}")
+            console.println(f"    samples:     {recall.get('samples', 0):,}")
+        if service_time:
+            console.println("")
+            console.println("  Service Time (OpenSearch 'took'):")
+            console.println(f"    p50:         {service_time.get('p50_ms', 0):.2f} ms")
+            console.println(f"    p90:         {service_time.get('p90_ms', 0):.2f} ms")
+            console.println(f"    p99:         {service_time.get('p99_ms', 0):.2f} ms")
+        console.println("")
+        console.println(f"  Errors:        {errors.get('total_errors', 0)} ({errors.get('error_rate', 0) * 100:.2f}%)")
+        console.println("")
+        console.println("=" * 60)
+        console.println("")
+
+        # Write metrics to metrics store for Final Score table
+        # The GlobalStatsCalculator reads these using get_mean, get_percentiles, etc.
+        # We need to store multiple samples so aggregation works correctly.
         if self.metrics_store:
-            task_name = "high-performance-search"
+            task_name = search_task.name if search_task else "high-performance-search"
             op_name = search_task.operation.name if search_task.operation else "search"
             op_type = "vector-search"
 
-            # Throughput
-            self.metrics_store.put_value_cluster_level(
-                name="throughput",
-                value=throughput.get("qps", 0),
-                unit="ops/s",
-                task=task_name,
-                operation=op_name,
-                operation_type=op_type
-            )
+            from osbenchmark.metrics import SampleType
+            sample_type = SampleType.Normal
+            time_series = results.get("time_series", [])
 
-            # Latency percentiles
-            for percentile, key in [("50.0", "p50_ms"), ("90.0", "p90_ms"),
-                                    ("99.0", "p99_ms"), ("99.9", "p999_ms")]:
-                if latency.get(key) is not None:
-                    self.metrics_store.put_value_cluster_level(
-                        name="latency",
-                        value=latency[key],
-                        unit="ms",
-                        task=task_name,
-                        operation=op_name,
-                        operation_type=op_type,
-                        sample_type="normal",
-                        meta_data={"percentile": percentile}
-                    )
+            # Store throughput samples (one per second bucket for min/mean/median/max)
+            # This allows GlobalStatsCalculator to compute aggregates
+            for bucket in time_series:
+                self.metrics_store.put_value_cluster_level(
+                    name="throughput",
+                    value=bucket["qps"],
+                    unit="ops/s",
+                    task=task_name,
+                    operation=op_name,
+                    operation_type=op_type,
+                    sample_type=sample_type,
+                    relative_time=bucket["second"]
+                )
 
-            # Service time
-            self.metrics_store.put_value_cluster_level(
-                name="service_time",
-                value=latency.get("avg_ms", 0),
-                unit="ms",
-                task=task_name,
-                operation=op_name,
-                operation_type=op_type
-            )
+            # Store latency samples (downsampled to ~1000 samples for percentile calculation)
+            # Collect all latencies from worker results
+            all_latencies_ms = []
+            for wr in results.get("_worker_results", []):
+                if "error" not in wr:
+                    for r in wr.get("results", []):
+                        if r.get("success", False):
+                            all_latencies_ms.append(r["latency_s"] * 1000)
 
-            # Recall metrics
+            # Downsample to max 1000 samples (evenly distributed)
+            if len(all_latencies_ms) > 1000:
+                step = len(all_latencies_ms) // 1000
+                all_latencies_ms = all_latencies_ms[::step][:1000]
+
+            for lat_ms in all_latencies_ms:
+                self.metrics_store.put_value_cluster_level(
+                    name="latency",
+                    value=lat_ms,
+                    unit="ms",
+                    task=task_name,
+                    operation=op_name,
+                    operation_type=op_type,
+                    sample_type=sample_type
+                )
+
+            # Store service_time samples (from OpenSearch 'took' field)
+            all_service_times = []
+            for wr in results.get("_worker_results", []):
+                if "error" not in wr:
+                    for r in wr.get("results", []):
+                        if r.get("success", False) and r.get("took_ms") is not None:
+                            all_service_times.append(r["took_ms"])
+
+            if len(all_service_times) > 1000:
+                step = len(all_service_times) // 1000
+                all_service_times = all_service_times[::step][:1000]
+
+            for st_ms in all_service_times:
+                self.metrics_store.put_value_cluster_level(
+                    name="service_time",
+                    value=st_ms,
+                    unit="ms",
+                    task=task_name,
+                    operation=op_name,
+                    operation_type=op_type,
+                    sample_type=sample_type
+                )
+
+            # Recall metrics (single values)
             if recall.get("recall@k") is not None:
                 self.metrics_store.put_value_cluster_level(
                     name="recall@k",
@@ -2285,7 +2383,7 @@ class WorkerCoordinator:
                     task=task_name,
                     operation=op_name,
                     operation_type=op_type,
-                    meta_data={"k": recall.get("k", k)}
+                    sample_type=sample_type
                 )
             if recall.get("recall@1") is not None:
                 self.metrics_store.put_value_cluster_level(
@@ -2294,17 +2392,19 @@ class WorkerCoordinator:
                     unit="",
                     task=task_name,
                     operation=op_name,
-                    operation_type=op_type
+                    operation_type=op_type,
+                    sample_type=sample_type
                 )
 
-            # Error rate
+            # Error rate (single value, stored as percentage)
             self.metrics_store.put_value_cluster_level(
                 name="error_rate",
-                value=errors.get("error_rate", 0),
-                unit="",
+                value=errors.get("error_rate", 0) * 100,  # Convert to percentage
+                unit="%",
                 task=task_name,
                 operation=op_name,
-                operation_type=op_type
+                operation_type=op_type,
+                sample_type=sample_type
             )
 
         # Signal completion
