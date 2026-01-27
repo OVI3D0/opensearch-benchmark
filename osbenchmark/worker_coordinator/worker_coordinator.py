@@ -270,11 +270,15 @@ class RawSample:
 
 
 class StartMetricsActor:
-    """Message to initialize MetricsActor."""
-    def __init__(self, sample_queue, metrics_store, workload_meta_data,
-                 test_procedure_meta_data, downsample_factor, neighbors_dataset=None, k=None):
+    """Message to initialize MetricsActor.
+
+    Passes config instead of metrics_store because metrics_store contains SSLContext
+    which cannot be pickled. MetricsActor creates its own metrics store connection.
+    """
+    def __init__(self, sample_queue, config, workload_meta_data, test_procedure_meta_data,
+                 downsample_factor, neighbors_dataset=None, k=None):
         self.sample_queue = sample_queue
-        self.metrics_store = metrics_store
+        self.config = config  # Serialized config - MetricsActor will create its own metrics store
         self.workload_meta_data = workload_meta_data
         self.test_procedure_meta_data = test_procedure_meta_data
         self.downsample_factor = downsample_factor
@@ -301,14 +305,15 @@ class MetricsActor(actor.BenchmarkActor):
     - service_time, client_processing_time, processing_time
     - latency, time_period, relative_time
     - recall@k, recall@1 (if enabled)
-    - Full sample object construction
 
     This reduces the hot path from ~500 ops to ~10 ops per request.
 
     Processing model:
+    - Creates its own metrics store connection (avoids pickle issues)
     - Wakes up every 100ms to process samples from shared queue
     - Processes up to MAX_SAMPLES_PER_CYCLE samples per wakeup
-    - On shutdown, drains all remaining samples before stopping
+    - Writes processed samples directly to metrics store
+    - On shutdown, drains remaining samples before stopping
     """
 
     WAKEUP_INTERVAL_SECONDS = 0.1  # Process every 100ms
@@ -334,16 +339,27 @@ class MetricsActor(actor.BenchmarkActor):
         """Initialize the metrics actor with required dependencies."""
         self.master = sender
         self.sample_queue = msg.sample_queue
-        self.metrics_store = msg.metrics_store
-        self.workload_meta_data = msg.workload_meta_data
-        self.test_procedure_meta_data = msg.test_procedure_meta_data
         self.downsample_factor = msg.downsample_factor
         self.neighbors_dataset = msg.neighbors_dataset
         self.k = msg.k
+        self.workload_meta_data = msg.workload_meta_data
+        self.test_procedure_meta_data = msg.test_procedure_meta_data
+
+        # Create our own metrics store connection using the config
+        cfg = load_local_config(msg.config)
+        workload_name = cfg.opts("workload", "workload.name", mandatory=False, default_value="unknown")
+        test_procedure_name = cfg.opts("workload", "test_procedure.name", mandatory=False, default_value="default")
+
+        self.metrics_store = metrics.metrics_store(
+            cfg=cfg,
+            workload=workload_name,
+            test_procedure=test_procedure_name,
+            read_only=False
+        )
 
         self.running = True
         self.wakeupAfter(datetime.timedelta(seconds=self.WAKEUP_INTERVAL_SECONDS))
-        self.logger.info("MetricsActor started - streaming mode with deferred calculations")
+        self.logger.info("MetricsActor started - streaming mode with own metrics store connection")
 
     @actor.no_retry("metrics_actor")
     def receiveMsg_WakeupMessage(self, msg, sender):
@@ -385,6 +401,10 @@ class MetricsActor(actor.BenchmarkActor):
         except queue.Empty:
             pass
 
+        # Close our metrics store connection
+        if self.metrics_store and self.metrics_store.opened:
+            self.metrics_store.close()
+
         self.logger.info("MetricsActor stopped. Drained %d samples. Total processed: %d",
                         drained, self.total_samples_processed)
         self.send(sender, MetricsActorStopped(self.total_samples_processed))
@@ -396,7 +416,7 @@ class MetricsActor(actor.BenchmarkActor):
         This is where we do everything that was previously in the hot path:
         1. Calculate timing metrics (service_time, latency, etc.)
         2. Calculate recall (if enabled and data available)
-        3. Store to metrics store (with downsampling)
+        3. Write directly to metrics store (with downsampling)
         """
         self.sample_count += 1
 
@@ -405,9 +425,6 @@ class MetricsActor(actor.BenchmarkActor):
         # Previously in AsyncExecutor._process_results()
         # ============================================================
         service_time = raw.request_end - raw.request_start
-        client_processing_time = (raw.client_request_end - raw.client_request_start) - service_time
-        processing_time = raw.processing_end - raw.processing_start
-        time_period = raw.request_end - raw.total_start
         relative_time = raw.request_start - raw.total_start
 
         if raw.throughput_throttled:
@@ -416,7 +433,7 @@ class MetricsActor(actor.BenchmarkActor):
             latency = service_time
 
         # ============================================================
-        # DEFERRED CALCULATION 2: Recall metrics
+        # DEFERRED CALCULATION 2: Recall metrics (if data available)
         # Previously in runner._vector_search_query_with_recall()
         # ============================================================
         recall_k = None
@@ -432,17 +449,16 @@ class MetricsActor(actor.BenchmarkActor):
             recall_1 = self._calculate_recall(raw.candidate_ids, neighbors, 1)
 
         # ============================================================
-        # DEFERRED: Store to metrics store (with downsampling)
+        # Write to metrics store (with downsampling)
         # ============================================================
         if self.sample_count % self.downsample_factor == 0:
             meta_data = self._merge_metadata(raw)
 
-            # Add recall to metadata if calculated
             if recall_k is not None:
                 meta_data["recall@k"] = recall_k
                 meta_data["recall@1"] = recall_1
 
-            # Store timing metrics
+            # Write latency metric
             self.metrics_store.put_value_cluster_level(
                 name="latency",
                 value=convert.seconds_to_ms(latency),
@@ -456,6 +472,7 @@ class MetricsActor(actor.BenchmarkActor):
                 meta_data=meta_data,
             )
 
+            # Write service_time metric
             self.metrics_store.put_value_cluster_level(
                 name="service_time",
                 value=convert.seconds_to_ms(service_time),
@@ -469,46 +486,13 @@ class MetricsActor(actor.BenchmarkActor):
                 meta_data=meta_data,
             )
 
-            # Store recall as separate metric if calculated
-            if recall_k is not None:
-                self.metrics_store.put_value_cluster_level(
-                    name="recall@k",
-                    value=recall_k,
-                    unit="",
-                    task=raw.task.name,
-                    operation=raw.task.operation.name,
-                    operation_type=raw.task.operation.type,
-                    sample_type=raw.sample_type,
-                    absolute_time=raw.absolute_time,
-                    relative_time=relative_time,
-                    meta_data=meta_data,
-                )
-
-                self.metrics_store.put_value_cluster_level(
-                    name="recall@1",
-                    value=recall_1,
-                    unit="",
-                    task=raw.task.name,
-                    operation=raw.task.operation.name,
-                    operation_type=raw.task.operation.type,
-                    sample_type=raw.sample_type,
-                    absolute_time=raw.absolute_time,
-                    relative_time=relative_time,
-                    meta_data=meta_data,
-                )
-
     def _calculate_recall(self, predictions: List[str], neighbors: List, top_k: int) -> float:
-        """
-        Calculate recall@k - moved from runner.py.
-
-        Previously this ran in the hot path for EVERY request.
-        Now it runs asynchronously in MetricsActor.
-        """
+        """Calculate recall@k."""
         if neighbors is None or len(neighbors) == 0:
             return 0.0
 
         min_num = min(top_k, len(neighbors))
-        truth_set = set(neighbors[:min_num])  # Convert to set for O(1) lookup
+        truth_set = set(neighbors[:min_num])
 
         if not truth_set:
             return 1.0
@@ -523,9 +507,9 @@ class MetricsActor(actor.BenchmarkActor):
             result.update(self.workload_meta_data)
         if self.test_procedure_meta_data:
             result.update(self.test_procedure_meta_data)
-        if raw.task.operation.meta_data:
+        if raw.task and raw.task.operation and raw.task.operation.meta_data:
             result.update(raw.task.operation.meta_data)
-        if raw.task.meta_data:
+        if raw.task and raw.task.meta_data:
             result.update(raw.task.meta_data)
         if raw.request_meta_data:
             result.update(raw.request_meta_data)
@@ -980,10 +964,10 @@ class WorkerCoordinatorActor(actor.BenchmarkActor):
             self.metrics_actor = self.createActor(MetricsActor)
             self.send(self.metrics_actor, StartMetricsActor(
                 sample_queue=self.coordinator.shared_sample_queue,
-                metrics_store=self.coordinator.metrics_store,
+                config=self.coordinator.config,  # Pass config - MetricsActor creates its own metrics store
                 workload_meta_data=self.coordinator.workload.meta_data if self.coordinator.workload else None,
                 test_procedure_meta_data=self.coordinator.test_procedure.meta_data if self.coordinator.test_procedure else None,
-                downsample_factor=self.coordinator.config.opts("reporting", "output.processingtime",
+                downsample_factor=self.coordinator.config.opts("reporting", "metrics.request.downsample.factor",
                                                                mandatory=False, default_value=1),
                 neighbors_dataset=None,  # Will be set by workload params if needed
                 k=None  # Will be set by workload params if needed
@@ -1306,9 +1290,11 @@ class WorkerCoordinator:
         self.profile_metrics_post_processor = None
 
         # Streaming metrics infrastructure
+        # Streaming metrics mode - enabled by default for better performance
+        # Defers metric calculations to MetricsActor, reducing hot path overhead
         self.streaming_metrics_enabled = self.config.opts(
             "worker_coordinator", "streaming.metrics.enabled",
-            mandatory=False, default_value=False
+            mandatory=False, default_value=True
         )
         if self.streaming_metrics_enabled:
             max_queue_size = int(self.config.opts(
