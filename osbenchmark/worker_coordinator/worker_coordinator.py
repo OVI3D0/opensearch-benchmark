@@ -220,15 +220,30 @@ class TaskFinished:
 #
 # Bypasses Thespian actors entirely for maximum throughput.
 # Uses ProcessPoolExecutor with dedicated clients per process.
+# Captures candidate_ids for recall calculation after benchmark.
 #
 ##################################
 
-def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration, k=100):
+
+def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration,
+                    id_field="_id", num_queries=None):
     """
     Worker function that runs in a separate process.
     Creates its own OpenSearch client and runs a tight query loop.
 
+    Returns results with candidate_ids for recall calculation.
+
     This is designed to be picklable for ProcessPoolExecutor.
+
+    Args:
+        worker_id: Unique identifier for this worker
+        hosts: OpenSearch host list
+        client_options: Client configuration
+        index: Index to search
+        body: Query body (will be cycled if num_queries provided)
+        duration: How long to run (seconds)
+        id_field: Field name containing document ID (default: "_id")
+        num_queries: Total number of unique queries (for cycling and recall matching)
     """
     import time
     import urllib3
@@ -247,39 +262,67 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration, k=1
     except Exception as e:
         return {
             "worker_id": worker_id,
-            "count": 0,
-            "duration": 0,
-            "latencies": [],
+            "start_time": time.time(),
+            "end_time": time.time(),
+            "results": [],
             "error": f"Failed to create client: {e}"
         }
 
-    # Run tight loop like VDBBench
-    start_time = time.perf_counter()
-    count = 0
-    latencies = []
-    errors = 0
+    # Results list - each entry is a query result
+    results = []
+    query_idx = worker_id % num_queries if num_queries else 0
+    start_time = time.time()
+    loop_start = time.perf_counter()
 
-    while time.perf_counter() - start_time < duration:
+    while time.perf_counter() - loop_start < duration:
+        timestamp = time.time()
         t0 = time.perf_counter()
+
         try:
-            os_client.search(
+            resp = os_client.search(
                 index=index,
                 body=body,
                 _source=False,
-                docvalue_fields=["_id"],
+                docvalue_fields=[id_field],
                 stored_fields="_none_",
             )
-            latencies.append(time.perf_counter() - t0)
-            count += 1
-        except Exception as e:
-            # Record latency but track error
-            latencies.append(time.perf_counter() - t0)
-            errors += 1
-            # Don't let errors stop the loop, but stop if too many
-            if errors > 100:
-                break
+            latency = time.perf_counter() - t0
 
-    total_duration = time.perf_counter() - start_time
+            # Extract candidate IDs for recall calculation
+            candidate_ids = []
+            hits = resp.get("hits", {}).get("hits", [])
+            for hit in hits:
+                fields = hit.get("fields", {})
+                if id_field in fields:
+                    # docvalue_fields returns arrays
+                    candidate_ids.append(str(fields[id_field][0]))
+
+            results.append({
+                "timestamp": timestamp,
+                "latency_s": latency,
+                "candidate_ids": candidate_ids,
+                "query_idx": query_idx,
+                "success": True,
+                "took_ms": resp.get("took"),
+                "total_hits": resp.get("hits", {}).get("total", {}).get("value"),
+            })
+
+        except Exception as e:
+            latency = time.perf_counter() - t0
+            results.append({
+                "timestamp": timestamp,
+                "latency_s": latency,
+                "candidate_ids": [],
+                "query_idx": query_idx,
+                "success": False,
+                "error_type": type(e).__name__,
+            })
+
+        # Cycle through queries
+        if num_queries:
+            query_idx = (query_idx + 1) % num_queries
+
+    end_time = time.time()
 
     try:
         os_client.close()
@@ -288,11 +331,210 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration, k=1
 
     return {
         "worker_id": worker_id,
-        "count": count,
-        "duration": total_duration,
-        "latencies": latencies,
-        "errors": errors,
+        "start_time": start_time,
+        "end_time": end_time,
+        "results": results,
     }
+
+
+class MetricsProcessor:
+    """
+    Processes raw query results and calculates all OSB metrics.
+
+    Runs in the coordinator process after all workers complete.
+    No IPC overhead - just pure computation on collected results.
+    """
+
+    def __init__(self, neighbors: list = None, k: int = 100):
+        """
+        Args:
+            neighbors: List of ground truth neighbor IDs per query.
+                      neighbors[query_idx] = [id1, id2, ...] (top-k correct IDs)
+            k: Number of results to consider for recall@k
+        """
+        self.neighbors = neighbors
+        self.k = k
+        self.logger = logging.getLogger(__name__)
+
+    def process(self, worker_results: list) -> dict:
+        """
+        Process all worker results and calculate full metrics.
+
+        Args:
+            worker_results: List of dicts from _hp_worker_loop
+
+        Returns:
+            dict with all metrics (throughput, latency, recall, errors, time_series)
+        """
+        # Flatten all results
+        all_results = []
+        for wr in worker_results:
+            if "error" in wr:
+                self.logger.error("Worker %d failed: %s", wr["worker_id"], wr["error"])
+                continue
+            all_results.extend(wr["results"])
+
+        if not all_results:
+            return {"error": "No results collected"}
+
+        # Sort by timestamp for time-series
+        all_results.sort(key=lambda r: r["timestamp"])
+
+        # Calculate all metrics
+        throughput = self._calc_throughput(worker_results, all_results)
+        latency = self._calc_latency_percentiles(all_results)
+        recall = self._calc_recall(all_results)
+        errors = self._calc_error_stats(all_results)
+        time_series = self._calc_time_series(all_results)
+        service_time = self._calc_service_time(all_results)
+
+        return {
+            "throughput": throughput,
+            "latency": latency,
+            "recall": recall,
+            "errors": errors,
+            "time_series": time_series,
+            "service_time": service_time,
+            "total_queries": len(all_results),
+        }
+
+    def _calc_throughput(self, worker_results, all_results) -> dict:
+        """Calculate throughput (QPS) from worker timing."""
+        successful = [r for r in all_results if r.get("success", False)]
+        total_ops = len(successful)
+
+        # Use actual wall-clock time from workers
+        valid_workers = [wr for wr in worker_results if "error" not in wr]
+        if not valid_workers:
+            return {"total_ops": 0, "duration_s": 0, "qps": 0}
+
+        start = min(wr["start_time"] for wr in valid_workers)
+        end = max(wr["end_time"] for wr in valid_workers)
+        duration = end - start
+
+        return {
+            "total_ops": total_ops,
+            "duration_s": duration,
+            "qps": total_ops / duration if duration > 0 else 0,
+        }
+
+    def _calc_latency_percentiles(self, results) -> dict:
+        """Calculate latency percentiles from successful queries."""
+        latencies = sorted([r["latency_s"] for r in results if r.get("success", False)])
+        n = len(latencies)
+
+        if n == 0:
+            return {}
+
+        return {
+            "p50_ms": latencies[int(n * 0.50)] * 1000,
+            "p90_ms": latencies[int(n * 0.90)] * 1000,
+            "p99_ms": latencies[int(n * 0.99)] * 1000,
+            "p999_ms": latencies[min(int(n * 0.999), n - 1)] * 1000,
+            "avg_ms": (sum(latencies) / n) * 1000,
+            "min_ms": latencies[0] * 1000,
+            "max_ms": latencies[-1] * 1000,
+        }
+
+    def _calc_recall(self, results) -> dict:
+        """Calculate recall@k and recall@1 using ground truth neighbors."""
+        if not self.neighbors:
+            return {
+                "recall@k": None,
+                "recall@1": None,
+                "note": "no ground truth provided"
+            }
+
+        recall_k_values = []
+        recall_1_values = []
+        num_neighbors = len(self.neighbors)
+
+        for r in results:
+            if not r.get("success", False) or not r.get("candidate_ids"):
+                continue
+
+            query_idx = r.get("query_idx", 0) % num_neighbors
+            ground_truth = self.neighbors[query_idx]
+
+            if not ground_truth:
+                continue
+
+            candidates = r["candidate_ids"]
+            k = min(self.k, len(ground_truth))
+
+            # recall@k = |retrieved ∩ relevant| / k
+            retrieved_set = set(candidates[:k])
+            relevant_set = set(ground_truth[:k])
+            recall_k = len(retrieved_set & relevant_set) / k if k > 0 else 0
+            recall_k_values.append(recall_k)
+
+            # recall@1 = 1 if top result is correct
+            if candidates and ground_truth:
+                recall_1 = 1.0 if candidates[0] == ground_truth[0] else 0.0
+                recall_1_values.append(recall_1)
+
+        return {
+            "recall@k": sum(recall_k_values) / len(recall_k_values) if recall_k_values else None,
+            "recall@1": sum(recall_1_values) / len(recall_1_values) if recall_1_values else None,
+            "k": self.k,
+            "samples": len(recall_k_values),
+        }
+
+    def _calc_error_stats(self, results) -> dict:
+        """Calculate error statistics."""
+        errors = [r for r in results if not r.get("success", False)]
+        error_types = {}
+        for e in errors:
+            etype = e.get("error_type", "unknown")
+            error_types[etype] = error_types.get(etype, 0) + 1
+
+        total = len(results)
+        return {
+            "total_errors": len(errors),
+            "error_rate": len(errors) / total if total > 0 else 0,
+            "by_type": error_types,
+        }
+
+    def _calc_time_series(self, results, bucket_size_s=1.0) -> list:
+        """Calculate per-second throughput for time-series visualization."""
+        if not results:
+            return []
+
+        successful = [r for r in results if r.get("success", False)]
+        if not successful:
+            return []
+
+        start_ts = successful[0]["timestamp"]
+        buckets = {}
+
+        for r in successful:
+            bucket_idx = int((r["timestamp"] - start_ts) / bucket_size_s)
+            buckets[bucket_idx] = buckets.get(bucket_idx, 0) + 1
+
+        return [
+            {"second": i, "qps": count / bucket_size_s}
+            for i, count in sorted(buckets.items())
+        ]
+
+    def _calc_service_time(self, results) -> dict:
+        """Calculate service time from OpenSearch 'took' field."""
+        took_values = [
+            r["took_ms"] for r in results
+            if r.get("success", False) and r.get("took_ms") is not None
+        ]
+
+        if not took_values:
+            return {}
+
+        took_values.sort()
+        n = len(took_values)
+
+        return {
+            "p50_ms": took_values[int(n * 0.50)],
+            "p90_ms": took_values[int(n * 0.90)],
+            "p99_ms": took_values[int(n * 0.99)],
+            "avg_ms": sum(took_values) / n,
+        }
 
 
 class HighPerformanceExecutor:
@@ -301,6 +543,7 @@ class HighPerformanceExecutor:
 
     Bypasses Thespian actors entirely for maximum throughput.
     Each process gets its own OpenSearch client and runs a tight loop.
+    Collects candidate_ids for recall calculation after benchmark completes.
 
     Usage:
         executor = HighPerformanceExecutor(hosts, client_options)
@@ -308,7 +551,8 @@ class HighPerformanceExecutor:
             num_clients=64,
             duration=30,
             index="my_index",
-            body={"query": {"match_all": {}}}
+            body={"query": {"knn": {...}}},
+            neighbors=[[id1, id2, ...], ...]  # ground truth per query
         )
     """
 
@@ -317,32 +561,29 @@ class HighPerformanceExecutor:
         self.client_options = client_options
         self.logger = logging.getLogger(__name__)
 
-    def run(self, num_clients, duration, index, body, k=100):
+    def run(self, num_clients, duration, index, body, k=100,
+            neighbors=None, id_field="_id", num_queries=None):
         """
-        Run high-performance benchmark.
+        Run high-performance benchmark with full metrics.
 
         Args:
             num_clients: Number of parallel worker processes
             duration: How long to run each worker (seconds)
             index: Index to query
             body: Query body
-            k: Top-k for vector search (if applicable)
+            k: Top-k for recall calculation
+            neighbors: Ground truth - list of [id1, id2, ...] per query
+            id_field: Field name containing document IDs
+            num_queries: Number of unique queries (for cycling)
 
         Returns:
-            dict with aggregated results:
-            - total_ops: Total operations across all workers
-            - total_duration: Wall clock time
-            - qps: Queries per second
-            - latencies: All latencies from all workers
-            - per_worker: Per-worker breakdown
+            dict with full metrics from MetricsProcessor
         """
         self.logger.info("Starting high-performance execution with %d clients for %d seconds",
                         num_clients, duration)
 
         # Use 'spawn' context for clean process isolation (like VDBBench)
         mp_context = multiprocessing.get_context('spawn')
-
-        start_time = time.perf_counter()
 
         with concurrent.futures.ProcessPoolExecutor(
             max_workers=num_clients,
@@ -358,52 +599,47 @@ class HighPerformanceExecutor:
                     index=index,
                     body=body,
                     duration=duration,
-                    k=k
+                    id_field=id_field,
+                    num_queries=num_queries,
                 )
                 for i in range(num_clients)
             ]
 
             # Collect results
-            results = [f.result() for f in futures]
+            worker_results = [f.result() for f in futures]
 
-        total_duration = time.perf_counter() - start_time
+        # Process metrics (runs in coordinator, no IPC)
+        processor = MetricsProcessor(neighbors=neighbors, k=k)
+        metrics = processor.process(worker_results)
 
-        # Aggregate results
-        total_ops = sum(r["count"] for r in results)
-        total_errors = sum(r.get("errors", 0) for r in results)
-        all_latencies = []
-        for r in results:
-            all_latencies.extend(r["latencies"])
-            if "error" in r:
-                self.logger.error("Worker %d failed: %s", r["worker_id"], r["error"])
-
-        qps = total_ops / total_duration if total_duration > 0 else 0
-
-        # Calculate percentiles
-        all_latencies.sort()
-        n = len(all_latencies)
-        p50 = all_latencies[int(n * 0.50)] * 1000 if n > 0 else 0  # ms
-        p90 = all_latencies[int(n * 0.90)] * 1000 if n > 0 else 0
-        p99 = all_latencies[int(n * 0.99)] * 1000 if n > 0 else 0
-        avg = (sum(all_latencies) / n) * 1000 if n > 0 else 0
+        # Log summary
+        throughput = metrics.get("throughput", {})
+        latency = metrics.get("latency", {})
+        recall = metrics.get("recall", {})
+        errors = metrics.get("errors", {})
 
         self.logger.info(
-            "High-performance execution complete: %d ops in %.2fs = %.2f QPS, "
-            "latency p50=%.2fms p90=%.2fms p99=%.2fms avg=%.2fms, errors=%d",
-            total_ops, total_duration, qps, p50, p90, p99, avg, total_errors
+            "High-performance execution complete:\n"
+            "  Throughput: %d ops in %.2fs = %.2f QPS\n"
+            "  Latency: p50=%.2fms p90=%.2fms p99=%.2fms avg=%.2fms\n"
+            "  Recall: recall@%d=%.4f recall@1=%.4f (%d samples)\n"
+            "  Errors: %d (%.2f%%)",
+            throughput.get("total_ops", 0),
+            throughput.get("duration_s", 0),
+            throughput.get("qps", 0),
+            latency.get("p50_ms", 0),
+            latency.get("p90_ms", 0),
+            latency.get("p99_ms", 0),
+            latency.get("avg_ms", 0),
+            recall.get("k", k),
+            recall.get("recall@k") or 0,
+            recall.get("recall@1") or 0,
+            recall.get("samples", 0),
+            errors.get("total_errors", 0),
+            errors.get("error_rate", 0) * 100,
         )
 
-        return {
-            "total_ops": total_ops,
-            "total_duration": total_duration,
-            "qps": qps,
-            "latency_p50_ms": p50,
-            "latency_p90_ms": p90,
-            "latency_p99_ms": p99,
-            "latency_avg_ms": avg,
-            "total_errors": total_errors,
-            "per_worker": results,
-        }
+        return metrics
 
 
 ##################################
@@ -1838,7 +2074,10 @@ class WorkerCoordinator:
         """
         Run benchmark using VDBBench-style ProcessPoolExecutor.
         Bypasses Thespian actors entirely for maximum throughput.
+        Calculates full metrics including recall using ground truth neighbors.
         """
+        from osbenchmark.utils.dataset import get_data_set, Context
+
         self.logger.info("=== HIGH-PERFORMANCE MODE ===")
         self.logger.info("Bypassing Thespian actors, using ProcessPoolExecutor")
 
@@ -1909,15 +2148,46 @@ class WorkerCoordinator:
 
         index = all_params.get("index", "target_index")
         body = all_params.get("body", {"query": {"match_all": {}}})
+        k = all_params.get("k", 100)
+        id_field = all_params.get("id-field-name", "_id")
 
         # Duration from warmup-time-period or default 30s
         duration = self.config.opts("workload", "warmup.time.period", mandatory=False, default_value=30)
+
+        # Load ground truth neighbors for recall calculation
+        neighbors = None
+        num_queries = None
+        neighbors_path = all_params.get("neighbors_data_set_path")
+        neighbors_format = all_params.get("neighbors_data_set_format", "hdf5")
+
+        if neighbors_path:
+            self.logger.info("Loading ground truth neighbors from: %s", neighbors_path)
+            try:
+                dataset = get_data_set(neighbors_format, neighbors_path, Context.NEIGHBORS)
+                neighbors = []
+                dataset.seek(0)
+                while True:
+                    try:
+                        neighbor = dataset.read(1)[0]
+                        # Convert to strings and take top-k
+                        neighbors.append([str(n) for n in neighbor[:k]])
+                    except StopIteration:
+                        break
+                num_queries = len(neighbors)
+                self.logger.info("Loaded %d ground truth neighbor sets for recall calculation", num_queries)
+            except Exception as e:
+                self.logger.warning("Failed to load neighbors dataset: %s. Recall will not be calculated.", e)
+                neighbors = None
+        else:
+            self.logger.info("No neighbors dataset provided. Recall will not be calculated.")
 
         self.logger.info("High-performance search config:")
         self.logger.info("  Hosts: %s", host_list)
         self.logger.info("  Clients: %d", num_clients)
         self.logger.info("  Index: %s", index)
         self.logger.info("  Duration: %d seconds", duration)
+        self.logger.info("  k: %d", k)
+        self.logger.info("  Ground truth queries: %s", num_queries or "N/A")
 
         # Run the benchmark
         executor = HighPerformanceExecutor(host_list, os_client_options)
@@ -1925,36 +2195,116 @@ class WorkerCoordinator:
             num_clients=num_clients,
             duration=duration,
             index=index,
-            body=body
+            body=body,
+            k=k,
+            neighbors=neighbors,
+            id_field=id_field,
+            num_queries=num_queries,
         )
 
-        # Store results in metrics store
+        # Extract metrics for logging and storage
+        throughput = results.get("throughput", {})
+        latency = results.get("latency", {})
+        recall = results.get("recall", {})
+        errors = results.get("errors", {})
+        service_time = results.get("service_time", {})
+
+        # Log results
         self.logger.info("=== HIGH-PERFORMANCE RESULTS ===")
-        self.logger.info("Total ops: %d", results["total_ops"])
-        self.logger.info("Duration: %.2f seconds", results["total_duration"])
-        self.logger.info("Throughput: %.2f ops/s", results["qps"])
-        self.logger.info("Latency p50: %.2f ms", results["latency_p50_ms"])
-        self.logger.info("Latency p90: %.2f ms", results["latency_p90_ms"])
-        self.logger.info("Latency p99: %.2f ms", results["latency_p99_ms"])
-        self.logger.info("Latency avg: %.2f ms", results["latency_avg_ms"])
+        self.logger.info("Throughput: %d ops in %.2fs = %.2f QPS",
+                        throughput.get("total_ops", 0),
+                        throughput.get("duration_s", 0),
+                        throughput.get("qps", 0))
+        self.logger.info("Latency: p50=%.2fms p90=%.2fms p99=%.2fms avg=%.2fms",
+                        latency.get("p50_ms", 0),
+                        latency.get("p90_ms", 0),
+                        latency.get("p99_ms", 0),
+                        latency.get("avg_ms", 0))
+        if recall.get("recall@k") is not None:
+            self.logger.info("Recall: recall@%d=%.4f recall@1=%.4f (%d samples)",
+                            recall.get("k", k),
+                            recall.get("recall@k", 0),
+                            recall.get("recall@1", 0),
+                            recall.get("samples", 0))
+        if service_time:
+            self.logger.info("Service time (OS 'took'): p50=%.2fms p90=%.2fms p99=%.2fms",
+                            service_time.get("p50_ms", 0),
+                            service_time.get("p90_ms", 0),
+                            service_time.get("p99_ms", 0))
+        self.logger.info("Errors: %d (%.2f%%)",
+                        errors.get("total_errors", 0),
+                        errors.get("error_rate", 0) * 100)
 
         # Write metrics to metrics store
         if self.metrics_store:
+            task_name = "high-performance-search"
+            op_name = search_task.operation.name if search_task.operation else "search"
+            op_type = "vector-search"
+
+            # Throughput
             self.metrics_store.put_value_cluster_level(
                 name="throughput",
-                value=results["qps"],
+                value=throughput.get("qps", 0),
                 unit="ops/s",
-                task="high-performance-search",
-                operation="search",
-                operation_type="search"
+                task=task_name,
+                operation=op_name,
+                operation_type=op_type
             )
+
+            # Latency percentiles
+            for percentile, key in [("50.0", "p50_ms"), ("90.0", "p90_ms"),
+                                    ("99.0", "p99_ms"), ("99.9", "p999_ms")]:
+                if latency.get(key) is not None:
+                    self.metrics_store.put_value_cluster_level(
+                        name="latency",
+                        value=latency[key],
+                        unit="ms",
+                        task=task_name,
+                        operation=op_name,
+                        operation_type=op_type,
+                        sample_type="normal",
+                        meta_data={"percentile": percentile}
+                    )
+
+            # Service time
             self.metrics_store.put_value_cluster_level(
                 name="service_time",
-                value=results["latency_avg_ms"],
+                value=latency.get("avg_ms", 0),
                 unit="ms",
-                task="high-performance-search",
-                operation="search",
-                operation_type="search"
+                task=task_name,
+                operation=op_name,
+                operation_type=op_type
+            )
+
+            # Recall metrics
+            if recall.get("recall@k") is not None:
+                self.metrics_store.put_value_cluster_level(
+                    name="recall@k",
+                    value=recall["recall@k"],
+                    unit="",
+                    task=task_name,
+                    operation=op_name,
+                    operation_type=op_type,
+                    meta_data={"k": recall.get("k", k)}
+                )
+            if recall.get("recall@1") is not None:
+                self.metrics_store.put_value_cluster_level(
+                    name="recall@1",
+                    value=recall["recall@1"],
+                    unit="",
+                    task=task_name,
+                    operation=op_name,
+                    operation_type=op_type
+                )
+
+            # Error rate
+            self.metrics_store.put_value_cluster_level(
+                name="error_rate",
+                value=errors.get("error_rate", 0),
+                unit="",
+                task=task_name,
+                operation=op_name,
+                operation_type=op_type
             )
 
         # Signal completion
