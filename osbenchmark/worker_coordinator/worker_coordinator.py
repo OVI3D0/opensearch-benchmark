@@ -2420,6 +2420,11 @@ class WorkerCoordinator:
 
         # Signal completion
         self.telemetry.on_benchmark_stop()
+        # For OsMetricsStore, metrics are stored directly to OpenSearch.
+        # We need to flush to ensure they're searchable before GlobalStatsCalculator queries.
+        if self.metrics_store:
+            self.metrics_store.flush()
+            self.logger.info("Flushed metrics store to ensure data is searchable")
         final_results = self.metrics_store.to_externalizable(clear=True) if self.metrics_store else {}
         self.logger.info("to_externalizable returned: %s (type: %s)",
                         "data" if final_results else "None/empty",
