@@ -2211,6 +2211,10 @@ class WorkerCoordinator:
         if client_options.get("timeout"):
             os_client_options["timeout"] = client_options["timeout"]
 
+        # Enable HTTP compression for better performance (matches VDBBench)
+        # kNN queries with 768 floats = ~6KB uncompressed, ~1-2KB compressed
+        os_client_options["http_compress"] = True
+
         # Extract search parameters from test procedure
         # Find the first search task
         search_task = None
