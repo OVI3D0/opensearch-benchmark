@@ -2838,9 +2838,26 @@ class WorkerCoordinator:
         op_type = benchmark_task.operation.type if hasattr(benchmark_task.operation, 'type') else benchmark_task.operation.operation_type
         is_vector_search = op_type == "vector-search"
 
-        # For non-vector-search operations, use the generic HP executor
-        if not is_vector_search:
+        # Operations that require corpus data (documents) - not yet supported in HP mode
+        # These need to read from corpus files which is complex
+        CORPUS_DEPENDENT_OPS = {"bulk", "index", "update"}
+
+        if op_type in CORPUS_DEPENDENT_OPS:
+            self.logger.info("Operation '%s' requires corpus data, falling back to legacy mode", op_type)
+            self.high_performance_mode = False
+            self._start_benchmark_legacy()
+            return
+
+        # For search operations (not vector-search), use the generic HP executor
+        if not is_vector_search and op_type == "search":
             self._run_generic_hp_benchmark(benchmark_task, host_list, os_client_options)
+            return
+
+        # For other operations not yet supported, fall back to legacy
+        if not is_vector_search:
+            self.logger.info("Operation '%s' not yet supported in HP mode, falling back to legacy mode", op_type)
+            self.high_performance_mode = False
+            self._start_benchmark_legacy()
             return
 
         # Vector-search specific path follows below
