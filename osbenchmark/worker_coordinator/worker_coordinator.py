@@ -299,44 +299,95 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
     start_time = time.time()
     loop_start = time.perf_counter()
 
-    while time.perf_counter() - loop_start < duration:
-        t0 = time.perf_counter()
+    # For pure throughput mode, use VDBBench-style minimal data collection
+    # Just latencies list + count, reconstruct timestamps later
+    if not collect_ids:
+        latencies = []
+        took_values = []
+        error_count = 0
 
-        try:
-            # Build query body from vector (same approach as VDBBench)
-            # Vectors are pre-converted to Python lists in coordinator
-            if query_vectors is not None:
-                vector = query_vectors[query_idx]
-                body = {
-                    "size": k,
-                    "query": {
-                        "knn": {
-                            field_name: {
-                                "vector": vector,
-                                "k": k
+        while time.perf_counter() - loop_start < duration:
+            s = time.perf_counter()
+            try:
+                if query_vectors is not None:
+                    vector = query_vectors[query_idx]
+                    body = {
+                        "size": k,
+                        "query": {
+                            "knn": {
+                                field_name: {
+                                    "vector": vector,
+                                    "k": k
+                                }
                             }
                         }
                     }
-                }
-            else:
-                # Fallback: match_all query if no vectors provided
-                body = {"size": k, "query": {"match_all": {}}}
+                else:
+                    body = {"size": k, "query": {"match_all": {}}}
 
-            resp = os_client.search(
-                index=index,
-                body=body,
-                _source=False,
-                docvalue_fields=[id_field] if collect_ids else [],
-                stored_fields="_none_",
-            )
-            latency = time.perf_counter() - t0
+                resp = os_client.search(
+                    index=index,
+                    body=body,
+                    _source=False,
+                    stored_fields="_none_",
+                )
+                latencies.append(time.perf_counter() - s)
+                took_values.append(resp.get("took"))
+            except Exception:
+                error_count += 1
 
-            # Timestamp needed for time-series metrics (time.time() is ~0.5μs)
-            timestamp = time.time()
+            query_idx = (query_idx + 1) % num_vectors
 
-            # Only extract candidate_ids if needed for recall calculation
-            # VDBBench doesn't use returned IDs during throughput testing
-            if collect_ids:
+        # Convert to results format for MetricsProcessor
+        # Reconstruct timestamps from start_time + cumulative latencies
+        cumulative = 0.0
+        for i, lat in enumerate(latencies):
+            cumulative += lat
+            results.append({
+                "timestamp": start_time + cumulative,
+                "latency_s": lat,
+                "success": True,
+                "took_ms": took_values[i] if i < len(took_values) else None,
+            })
+        for _ in range(error_count):
+            results.append({
+                "timestamp": start_time,
+                "latency_s": 0,
+                "success": False,
+                "error_type": "Unknown",
+            })
+    else:
+        # Full collection mode with IDs for recall calculation
+        while time.perf_counter() - loop_start < duration:
+            t0 = time.perf_counter()
+
+            try:
+                if query_vectors is not None:
+                    vector = query_vectors[query_idx]
+                    body = {
+                        "size": k,
+                        "query": {
+                            "knn": {
+                                field_name: {
+                                    "vector": vector,
+                                    "k": k
+                                }
+                            }
+                        }
+                    }
+                else:
+                    body = {"size": k, "query": {"match_all": {}}}
+
+                resp = os_client.search(
+                    index=index,
+                    body=body,
+                    _source=False,
+                    docvalue_fields=[id_field],
+                    stored_fields="_none_",
+                )
+                latency = time.perf_counter() - t0
+                timestamp = time.time()
+
                 hits = resp["hits"]["hits"]
                 candidate_ids = [str(h["fields"][id_field][0]) for h in hits] if hits else []
                 results.append({
@@ -347,19 +398,10 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
                     "success": True,
                     "took_ms": resp.get("took"),
                 })
-            else:
-                # Minimal result for pure throughput (matches VDBBench hot path)
-                results.append({
-                    "timestamp": timestamp,
-                    "latency_s": latency,
-                    "success": True,
-                    "took_ms": resp.get("took"),
-                })
 
-        except Exception as e:
-            latency = time.perf_counter() - t0
-            timestamp = time.time()
-            if collect_ids:
+            except Exception as e:
+                latency = time.perf_counter() - t0
+                timestamp = time.time()
                 results.append({
                     "timestamp": timestamp,
                     "latency_s": latency,
@@ -368,16 +410,8 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
                     "success": False,
                     "error_type": type(e).__name__,
                 })
-            else:
-                results.append({
-                    "timestamp": timestamp,
-                    "latency_s": latency,
-                    "success": False,
-                    "error_type": type(e).__name__,
-                })
 
-        # Cycle through query vectors
-        query_idx = (query_idx + 1) % num_vectors
+            query_idx = (query_idx + 1) % num_vectors
 
     end_time = time.time()
 
