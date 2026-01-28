@@ -228,7 +228,8 @@ class TaskFinished:
 def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
                     query_vectors=None, field_name="embedding", k=100,
                     id_field="_id", num_queries=None,
-                    ready_queue=None, start_condition=None):
+                    ready_queue=None, start_condition=None,
+                    collect_ids=True):
     """
     Worker function that runs in a separate process.
     Creates its own OpenSearch client and runs a tight query loop.
@@ -240,7 +241,7 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
     Uses synchronization barrier (ready_queue + start_condition) to ensure
     all workers start simultaneously, matching VDBBench's pattern.
 
-    Returns results with candidate_ids for recall calculation.
+    Returns results with candidate_ids for recall calculation (if collect_ids=True).
 
     This is designed to be picklable for ProcessPoolExecutor.
 
@@ -257,6 +258,7 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
         num_queries: Total number of unique queries (for cycling and recall matching)
         ready_queue: Shared queue to signal worker is ready
         start_condition: Shared condition to wait for synchronized start
+        collect_ids: Whether to extract candidate IDs (for recall). Set False for pure throughput.
     """
     import time
     import urllib3
@@ -298,7 +300,6 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
     loop_start = time.perf_counter()
 
     while time.perf_counter() - loop_start < duration:
-        timestamp = time.time()
         t0 = time.perf_counter()
 
         try:
@@ -325,40 +326,47 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
                 index=index,
                 body=body,
                 _source=False,
-                docvalue_fields=[id_field],
+                docvalue_fields=[id_field] if collect_ids else [],
                 stored_fields="_none_",
             )
             latency = time.perf_counter() - t0
 
-            # Extract candidate IDs for recall calculation
-            candidate_ids = []
-            hits = resp.get("hits", {}).get("hits", [])
-            for hit in hits:
-                fields = hit.get("fields", {})
-                if id_field in fields:
-                    # docvalue_fields returns arrays
-                    candidate_ids.append(str(fields[id_field][0]))
-
-            results.append({
-                "timestamp": timestamp,
-                "latency_s": latency,
-                "candidate_ids": candidate_ids,
-                "query_idx": query_idx,
-                "success": True,
-                "took_ms": resp.get("took"),
-                "total_hits": resp.get("hits", {}).get("total", {}).get("value"),
-            })
+            # Only extract candidate_ids if needed for recall calculation
+            # VDBBench doesn't use returned IDs during throughput testing
+            if collect_ids:
+                hits = resp["hits"]["hits"]
+                candidate_ids = [str(h["fields"][id_field][0]) for h in hits] if hits else []
+                results.append({
+                    "latency_s": latency,
+                    "candidate_ids": candidate_ids,
+                    "query_idx": query_idx,
+                    "success": True,
+                    "took_ms": resp.get("took"),
+                })
+            else:
+                # Minimal result for pure throughput (matches VDBBench hot path)
+                results.append({
+                    "latency_s": latency,
+                    "success": True,
+                    "took_ms": resp.get("took"),
+                })
 
         except Exception as e:
             latency = time.perf_counter() - t0
-            results.append({
-                "timestamp": timestamp,
-                "latency_s": latency,
-                "candidate_ids": [],
-                "query_idx": query_idx,
-                "success": False,
-                "error_type": type(e).__name__,
-            })
+            if collect_ids:
+                results.append({
+                    "latency_s": latency,
+                    "candidate_ids": [],
+                    "query_idx": query_idx,
+                    "success": False,
+                    "error_type": type(e).__name__,
+                })
+            else:
+                results.append({
+                    "latency_s": latency,
+                    "success": False,
+                    "error_type": type(e).__name__,
+                })
 
         # Cycle through query vectors
         query_idx = (query_idx + 1) % num_vectors
@@ -628,6 +636,7 @@ class HighPerformanceExecutor:
 
         self.logger.info("Starting high-performance execution with %d clients for %d seconds",
                         num_clients, duration)
+        self.logger.info("ID collection for recall: %s", "enabled" if neighbors else "disabled (pure throughput mode)")
 
         # Use 'spawn' context for clean process isolation (like VDBBench)
         mp_context = multiprocessing.get_context('spawn')
@@ -645,6 +654,10 @@ class HighPerformanceExecutor:
                 max_workers=num_clients,
                 mp_context=mp_context
             ) as executor:
+                # Only collect IDs if we have neighbors for recall calculation
+                # This matches VDBBench which doesn't use returned IDs during throughput testing
+                collect_ids = bool(neighbors)
+
                 # Submit all workers
                 futures = [
                     executor.submit(
@@ -661,6 +674,7 @@ class HighPerformanceExecutor:
                         num_queries=num_queries,
                         ready_queue=ready_queue,
                         start_condition=start_condition,
+                        collect_ids=collect_ids,
                     )
                     for i in range(num_clients)
                 ]
@@ -2196,20 +2210,22 @@ class WorkerCoordinator:
                 host_entry["scheme"] = "http"
             host_list.append(host_entry)
 
-        # Prepare client options for opensearch-py
+        # Prepare client options for opensearch-py (matching VDBBench configuration)
         os_client_options = {}
         if client_options.get("use_ssl") or client_options.get("scheme") == "https":
             os_client_options["use_ssl"] = True
         if client_options.get("verify_certs") is False:
             os_client_options["verify_certs"] = False
             os_client_options["ssl_show_warn"] = False
+            # Match VDBBench: disable SSL hostname assertion for faster SSL handshakes
+            os_client_options["ssl_assert_hostname"] = False
         if "basic_auth_user" in client_options and "basic_auth_password" in client_options:
             os_client_options["http_auth"] = (
                 client_options["basic_auth_user"],
                 client_options["basic_auth_password"]
             )
-        if client_options.get("timeout"):
-            os_client_options["timeout"] = client_options["timeout"]
+        # Use timeout from config, or VDBBench default of 600 seconds
+        os_client_options["timeout"] = client_options.get("timeout", 600)
 
         # Enable HTTP compression for better performance (matches VDBBench)
         # kNN queries with 768 floats = ~6KB uncompressed, ~1-2KB compressed
@@ -2359,6 +2375,7 @@ class WorkerCoordinator:
         self.logger.info("  k: %d", k)
         self.logger.info("  Query vectors: %s", num_queries or "N/A (using match_all)")
         self.logger.info("  Ground truth neighbors: %s", len(neighbors) if neighbors else "N/A")
+        self.logger.info("  Client options: %s", {k: v for k, v in os_client_options.items() if k != "http_auth"})
 
         # Run the benchmark
         executor = HighPerformanceExecutor(host_list, os_client_options)
