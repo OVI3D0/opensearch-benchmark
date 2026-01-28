@@ -2831,8 +2831,7 @@ class WorkerCoordinator:
         if not benchmark_task:
             self.logger.error("No benchmarkable task found in test procedure, falling back to legacy mode")
             self.high_performance_mode = False
-            self._start_benchmark_legacy()
-            return
+            return False  # Signal to start_benchmark to continue with legacy
 
         # Determine operation type
         op_type = benchmark_task.operation.type if hasattr(benchmark_task.operation, 'type') else benchmark_task.operation.operation_type
@@ -2845,20 +2844,18 @@ class WorkerCoordinator:
         if op_type in CORPUS_DEPENDENT_OPS:
             self.logger.info("Operation '%s' requires corpus data, falling back to legacy mode", op_type)
             self.high_performance_mode = False
-            self._start_benchmark_legacy()
-            return
+            return False  # Signal to start_benchmark to continue with legacy
 
         # For search operations (not vector-search), use the generic HP executor
         if not is_vector_search and op_type == "search":
             self._run_generic_hp_benchmark(benchmark_task, host_list, os_client_options)
-            return
+            return True  # HP mode handled the benchmark
 
         # For other operations not yet supported, fall back to legacy
         if not is_vector_search:
             self.logger.info("Operation '%s' not yet supported in HP mode, falling back to legacy mode", op_type)
             self.high_performance_mode = False
-            self._start_benchmark_legacy()
-            return
+            return False  # Signal to start_benchmark to continue with legacy
 
         # Vector-search specific path follows below
         search_task = benchmark_task
@@ -3163,6 +3160,7 @@ class WorkerCoordinator:
         self.telemetry.on_benchmark_stop()
         final_results = self.metrics_store.to_externalizable(clear=True) if self.metrics_store else {}
         self.target.on_benchmark_complete(final_results)
+        return True  # HP mode successfully handled the benchmark
 
     def start_benchmark(self):
         self.logger.info("OSB is about to start.")
@@ -3173,9 +3171,11 @@ class WorkerCoordinator:
         self.logger.info("Cluster-level telemetry devices are now attached.")
 
         # High-performance mode: bypass Thespian entirely
+        # Returns True if HP mode handled the benchmark, False if fallback to legacy is needed
         if self.high_performance_mode:
-            self._run_high_performance_benchmark()
-            return
+            if self._run_high_performance_benchmark():
+                return
+            # HP mode requested fallback to legacy, continue below
         # if redline testing or load testing is enabled, modify the client + throughput number for the task(s)
         # target throughput + clients will then be equal to the qps passed in through --redline-test or --load-test
         redline_enabled = self.config.opts("workload", "redline.test", mandatory=False, default_value=False)
