@@ -429,6 +429,184 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
     }
 
 
+def _hp_generic_worker_loop(worker_id, hosts, client_options, operation_config,
+                            duration, ready_queue=None, start_condition=None):
+    """
+    Generic HP worker that handles any OpenSearch operation type.
+
+    This is designed to be picklable for ProcessPoolExecutor.
+
+    Args:
+        worker_id: Unique identifier for this worker
+        hosts: OpenSearch host list
+        client_options: Client configuration
+        operation_config: Dict with operation details:
+            - operation_type: "search", "bulk", "index", etc.
+            - index: Target index name
+            - request_bodies: List of pre-generated request bodies to cycle through
+            - request_params: Additional params to pass to client method
+        duration: How long to run (seconds)
+        ready_queue: Shared queue to signal worker is ready
+        start_condition: Shared condition to wait for synchronized start
+
+    Returns:
+        Dict with worker_id, timing info, and results list
+    """
+    import time
+    import urllib3
+    from opensearchpy import OpenSearch
+
+    # Suppress SSL warnings if verify_certs is disabled
+    if client_options.get("verify_certs") is False:
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    # Create dedicated client for this process
+    try:
+        os_client = OpenSearch(hosts=hosts, **client_options)
+    except Exception as e:
+        if ready_queue is not None:
+            ready_queue.put(worker_id)
+        return {
+            "worker_id": worker_id,
+            "start_time": time.time(),
+            "end_time": time.time(),
+            "results": [],
+            "error": f"Failed to create client: {e}"
+        }
+
+    # Extract operation config
+    op_type = operation_config.get("operation_type", "search")
+    index = operation_config.get("index")
+    request_bodies = operation_config.get("request_bodies", [{}])
+    request_params = operation_config.get("request_params", {})
+
+    # Synchronization barrier
+    if ready_queue is not None and start_condition is not None:
+        ready_queue.put(worker_id)
+        with start_condition:
+            start_condition.wait()
+
+    # Results collection
+    latencies = []
+    took_values = []
+    error_count = 0
+    num_bodies = len(request_bodies) if request_bodies else 1
+    body_idx = worker_id % num_bodies
+
+    start_time = time.time()
+    loop_start = time.perf_counter()
+
+    while time.perf_counter() - loop_start < duration:
+        body = request_bodies[body_idx] if request_bodies else {}
+        t0 = time.perf_counter()
+
+        try:
+            took_ms = None
+
+            if op_type in ("search", "vector-search"):
+                resp = os_client.search(index=index, body=body, **request_params)
+                took_ms = resp.get("took")
+
+            elif op_type == "bulk":
+                resp = os_client.bulk(body=body, index=index, **request_params)
+                took_ms = resp.get("took")
+
+            elif op_type == "index":
+                resp = os_client.index(index=index, body=body, **request_params)
+                # index doesn't have 'took'
+
+            elif op_type == "create-index":
+                # Skip - this is a setup operation, not a benchmark operation
+                break
+
+            elif op_type == "delete":
+                doc_id = body.get("_id") or request_params.get("id")
+                resp = os_client.delete(index=index, id=doc_id, **request_params)
+
+            elif op_type == "update":
+                doc_id = body.get("_id") or request_params.get("id")
+                resp = os_client.update(index=index, id=doc_id, body=body, **request_params)
+
+            elif op_type == "get":
+                doc_id = body.get("_id") or request_params.get("id")
+                resp = os_client.get(index=index, id=doc_id, **request_params)
+
+            elif op_type == "mget":
+                resp = os_client.mget(body=body, index=index, **request_params)
+
+            elif op_type == "msearch":
+                resp = os_client.msearch(body=body, index=index, **request_params)
+                # msearch returns array of responses, sum the 'took' values
+                if "responses" in resp:
+                    took_ms = sum(r.get("took", 0) for r in resp["responses"])
+
+            elif op_type == "scroll":
+                scroll_id = body.get("scroll_id") or request_params.get("scroll_id")
+                resp = os_client.scroll(scroll_id=scroll_id, **request_params)
+                took_ms = resp.get("took")
+
+            elif op_type == "clear-scroll":
+                scroll_id = body.get("scroll_id") or request_params.get("scroll_id")
+                resp = os_client.clear_scroll(scroll_id=scroll_id, **request_params)
+
+            elif op_type == "sql":
+                resp = os_client.transport.perform_request(
+                    "POST", "/_plugins/_sql",
+                    body=body, params=request_params
+                )
+
+            else:
+                # Default: try generic transport request
+                # This allows custom operations to work
+                method = request_params.pop("method", "GET")
+                path = request_params.pop("path", f"/{index}/_search")
+                resp = os_client.transport.perform_request(method, path, body=body, params=request_params)
+                if isinstance(resp, dict):
+                    took_ms = resp.get("took")
+
+            latencies.append(time.perf_counter() - t0)
+            took_values.append(took_ms)
+
+        except Exception:
+            error_count += 1
+            latencies.append(time.perf_counter() - t0)
+            took_values.append(None)
+
+        body_idx = (body_idx + 1) % num_bodies
+
+    end_time = time.time()
+
+    # Convert to results format
+    results = []
+    cumulative = 0.0
+    for i, lat in enumerate(latencies):
+        cumulative += lat
+        results.append({
+            "timestamp": start_time + cumulative,
+            "latency_s": lat,
+            "success": took_values[i] is not None or (i >= len(latencies) - error_count),
+            "took_ms": took_values[i],
+        })
+
+    # Mark errors at the end
+    for i in range(len(latencies) - error_count, len(latencies)):
+        if i < len(results):
+            results[i]["success"] = False
+            results[i]["error_type"] = "Unknown"
+
+    try:
+        os_client.close()
+    except Exception:
+        pass
+
+    return {
+        "worker_id": worker_id,
+        "start_time": start_time,
+        "end_time": end_time,
+        "results": results,
+    }
+
+
 class MetricsProcessor:
     """
     Processes raw query results and calculates all OSB metrics.
@@ -795,6 +973,202 @@ class HighPerformanceExecutor:
         )
 
         return metrics
+
+
+class GenericHighPerformanceExecutor:
+    """
+    Generic high-performance executor that works with ANY operation type.
+
+    Bypasses Thespian actors entirely for maximum throughput.
+    Each process gets its own OpenSearch client and runs a tight loop.
+
+    Usage:
+        executor = GenericHighPerformanceExecutor(hosts, client_options)
+        results = executor.run(
+            num_clients=64,
+            duration=30,
+            operation_config={
+                "operation_type": "search",
+                "index": "my_index",
+                "request_bodies": [...],  # Pre-generated request bodies
+                "request_params": {"_source": False},
+            }
+        )
+    """
+
+    def __init__(self, hosts, client_options):
+        self.hosts = hosts
+        self.client_options = client_options
+        self.logger = logging.getLogger(__name__)
+
+    def run(self, num_clients, duration, operation_config, quiet=False):
+        """
+        Run high-performance benchmark for any operation type.
+
+        Args:
+            num_clients: Number of parallel worker processes
+            duration: How long to run each worker (seconds)
+            operation_config: Dict with:
+                - operation_type: "search", "bulk", "index", etc.
+                - index: Target index name
+                - request_bodies: List of pre-generated request bodies
+                - request_params: Additional params for the client method
+            quiet: If True, suppress progress output
+
+        Returns:
+            dict with metrics from MetricsProcessor
+        """
+        from osbenchmark.utils import console
+
+        op_type = operation_config.get("operation_type", "search")
+        index = operation_config.get("index", "")
+        num_bodies = len(operation_config.get("request_bodies", []))
+
+        self.logger.info("Starting generic HP execution: %s on %s", op_type, index)
+        self.logger.info("  Clients: %d, Duration: %ds, Request bodies: %d",
+                        num_clients, duration, num_bodies)
+
+        # Use 'spawn' context for clean process isolation
+        mp_context = multiprocessing.get_context('spawn')
+
+        # Progress indicator
+        progress_publisher = console.progress() if not quiet else None
+        task_name = f"{op_type} ({num_clients} clients)"
+
+        with multiprocessing.Manager() as manager:
+            ready_queue = manager.Queue()
+            start_condition = manager.Condition()
+
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=num_clients,
+                mp_context=mp_context
+            ) as executor:
+                # Submit all workers
+                futures = [
+                    executor.submit(
+                        _hp_generic_worker_loop,
+                        worker_id=i,
+                        hosts=self.hosts,
+                        client_options=self.client_options,
+                        operation_config=operation_config,
+                        duration=duration,
+                        ready_queue=ready_queue,
+                        start_condition=start_condition,
+                    )
+                    for i in range(num_clients)
+                ]
+
+                # Wait for all workers to be ready
+                self.logger.info("Waiting for %d workers to initialize...", num_clients)
+                ready_count = 0
+                while ready_count < num_clients:
+                    try:
+                        ready_queue.get(timeout=60)
+                        ready_count += 1
+                    except Exception:
+                        self.logger.warning("Timeout waiting for workers")
+                        break
+
+                # Start all workers simultaneously
+                self.logger.info("All workers ready, starting synchronized benchmark")
+                with start_condition:
+                    start_condition.notify_all()
+
+                # Show progress
+                start_time = time.perf_counter()
+                while not all(f.done() for f in futures):
+                    elapsed = time.perf_counter() - start_time
+                    progress_pct = min(100, int((elapsed / duration) * 100))
+                    if progress_publisher:
+                        progress_publisher.print(f"Running {task_name}", f"[{progress_pct:3d}% done]")
+                    time.sleep(0.5)
+
+                if progress_publisher:
+                    progress_publisher.print(f"Running {task_name}", "[100% done]")
+                    progress_publisher.finish()
+
+                # Collect results
+                worker_results = [f.result() for f in futures]
+
+        # Process metrics
+        processor = MetricsProcessor(neighbors=None, k=100)
+        metrics_result = processor.process(worker_results)
+
+        # Log summary
+        throughput = metrics_result.get("throughput", {})
+        latency = metrics_result.get("latency", {})
+        errors = metrics_result.get("errors", {})
+        service_time = metrics_result.get("service_time", {})
+
+        self.logger.info(
+            "Generic HP execution complete:\n"
+            "  Operation: %s on %s\n"
+            "  Throughput: %d ops in %.2fs = %.2f ops/s\n"
+            "  Latency: p50=%.2fms p90=%.2fms p99=%.2fms avg=%.2fms\n"
+            "  Service time: p50=%.2fms p90=%.2fms p99=%.2fms\n"
+            "  Errors: %d (%.2f%%)",
+            op_type, index,
+            throughput.get("total_ops", 0),
+            throughput.get("duration_s", 0),
+            throughput.get("qps", 0),
+            latency.get("p50_ms", 0),
+            latency.get("p90_ms", 0),
+            latency.get("p99_ms", 0),
+            latency.get("avg_ms", 0),
+            service_time.get("p50_ms", 0),
+            service_time.get("p90_ms", 0),
+            service_time.get("p99_ms", 0),
+            errors.get("total_errors", 0),
+            errors.get("error_rate", 0) * 100,
+        )
+
+        return metrics_result
+
+
+def generate_request_bodies_from_param_source(workload, task, num_bodies=10000):
+    """
+    Use existing param source infrastructure to pre-generate request bodies.
+
+    This allows HP mode to work with any workload without modification.
+
+    Args:
+        workload: The loaded workload object
+        task: The task to generate bodies for
+        num_bodies: Maximum number of bodies to generate
+
+    Returns:
+        List of request body dicts
+    """
+    from osbenchmark.workload import params
+
+    logger = logging.getLogger(__name__)
+    op = task.operation
+
+    try:
+        # Get the param source for this operation type
+        param_source = params.param_source_for_operation(
+            op.type, workload, op.params, task.name
+        )
+
+        bodies = []
+        for _ in range(num_bodies):
+            try:
+                p = param_source.params()
+                body = p.get("body", {})
+                bodies.append(body)
+            except StopIteration:
+                # Param source exhausted
+                break
+            except Exception as e:
+                logger.debug("Error generating body: %s", e)
+                break
+
+        logger.info("Generated %d request bodies for %s", len(bodies), op.name)
+        return bodies
+
+    except Exception as e:
+        logger.warning("Failed to generate bodies from param source: %s", e)
+        return [{}]
 
 
 ##################################
@@ -2225,6 +2599,165 @@ class WorkerCoordinator:
 
         self.target.prepare_workload([h["host"] for h in self.worker_ips], self.config, self.workload)
 
+    def _run_generic_hp_benchmark(self, task, host_list, client_options):
+        """
+        Run a generic high-performance benchmark for any operation type.
+        Uses GenericHighPerformanceExecutor with pre-generated request bodies.
+        """
+        self.logger.info("=== GENERIC HIGH-PERFORMANCE MODE ===")
+
+        op = task.operation
+        op_type = op.type if hasattr(op, 'type') else op.operation_type
+        op_params = op.params if op.params else {}
+        num_clients = task.clients
+        index = op_params.get("index") or op_params.get("target_index_name", "")
+
+        # Duration from config
+        duration = self.config.opts("workload", "warmup.time.period", mandatory=False, default_value=30)
+
+        self.logger.info("Operation: %s on %s", op_type, index)
+        self.logger.info("Clients: %d, Duration: %ds", num_clients, duration)
+
+        # Generate request bodies from param source
+        self.logger.info("Generating request bodies from param source...")
+        request_bodies = generate_request_bodies_from_param_source(
+            self.workload, task, num_bodies=10000
+        )
+
+        # Extract request params (things like _source, size, etc.)
+        request_params = {}
+        for key in ["_source", "size", "stored_fields", "docvalue_fields", "routing", "preference"]:
+            if key in op_params:
+                request_params[key] = op_params[key]
+
+        # Build operation config for generic worker
+        operation_config = {
+            "operation_type": op_type,
+            "index": index,
+            "request_bodies": request_bodies,
+            "request_params": request_params,
+        }
+
+        self.logger.info("Request bodies generated: %d", len(request_bodies))
+        self.logger.info("Client options: %s", {k: v for k, v in client_options.items() if k != "http_auth"})
+
+        # Run the benchmark
+        executor = GenericHighPerformanceExecutor(host_list, client_options)
+        results = executor.run(
+            num_clients=num_clients,
+            duration=duration,
+            operation_config=operation_config,
+            quiet=self.quiet,
+        )
+
+        # Extract and log metrics
+        throughput = results.get("throughput", {})
+        latency = results.get("latency", {})
+        errors = results.get("errors", {})
+        service_time = results.get("service_time", {})
+
+        self.logger.info("=== GENERIC HP RESULTS ===")
+        self.logger.info("Throughput: %d ops in %.2fs = %.2f ops/s",
+                        throughput.get("total_ops", 0),
+                        throughput.get("duration_s", 0),
+                        throughput.get("qps", 0))
+        self.logger.info("Latency: p50=%.2fms p90=%.2fms p99=%.2fms avg=%.2fms",
+                        latency.get("p50_ms", 0),
+                        latency.get("p90_ms", 0),
+                        latency.get("p99_ms", 0),
+                        latency.get("avg_ms", 0))
+        if service_time:
+            self.logger.info("Service time: p50=%.2fms p90=%.2fms p99=%.2fms",
+                            service_time.get("p50_ms", 0),
+                            service_time.get("p90_ms", 0),
+                            service_time.get("p99_ms", 0))
+        self.logger.info("Errors: %d (%.2f%%)",
+                        errors.get("total_errors", 0),
+                        errors.get("error_rate", 0) * 100)
+
+        # Store metrics to metrics store
+        if self.metrics_store:
+            task_name = task.name if task.name else op.name
+            op_name = op.name if op.name else op_type
+
+            from osbenchmark.metrics import SampleType
+            sample_type = SampleType.Normal
+            time_series = results.get("time_series", [])
+
+            # Store throughput samples
+            for bucket in time_series:
+                self.metrics_store.put_value_cluster_level(
+                    name="throughput",
+                    value=bucket["qps"],
+                    unit="ops/s",
+                    task=task_name,
+                    operation=op_name,
+                    operation_type=op_type,
+                    sample_type=sample_type,
+                    relative_time=bucket["second"]
+                )
+
+            # Store latency samples
+            all_latencies_ms = []
+            for wr in results.get("_worker_results", []):
+                if "error" not in wr:
+                    for r in wr.get("results", []):
+                        if r.get("success", False):
+                            all_latencies_ms.append(r["latency_s"] * 1000)
+
+            # Downsample to max 1000 samples
+            if len(all_latencies_ms) > 1000:
+                step = len(all_latencies_ms) // 1000
+                all_latencies_ms = all_latencies_ms[::step][:1000]
+
+            for lat_ms in all_latencies_ms:
+                self.metrics_store.put_value_cluster_level(
+                    name="latency",
+                    value=lat_ms,
+                    unit="ms",
+                    task=task_name,
+                    operation=op_name,
+                    operation_type=op_type,
+                    sample_type=sample_type
+                )
+
+            # Store service_time samples
+            all_service_times = []
+            for wr in results.get("_worker_results", []):
+                if "error" not in wr:
+                    for r in wr.get("results", []):
+                        if r.get("success", False) and r.get("took_ms") is not None:
+                            all_service_times.append(r["took_ms"])
+
+            if len(all_service_times) > 1000:
+                step = len(all_service_times) // 1000
+                all_service_times = all_service_times[::step][:1000]
+
+            for st_ms in all_service_times:
+                self.metrics_store.put_value_cluster_level(
+                    name="service_time",
+                    value=st_ms,
+                    unit="ms",
+                    task=task_name,
+                    operation=op_name,
+                    operation_type=op_type,
+                    sample_type=sample_type
+                )
+
+            # Store error rate
+            self.metrics_store.put_value_cluster_level(
+                name="error_rate",
+                value=errors.get("error_rate", 0) * 100,
+                unit="%",
+                task=task_name,
+                operation=op_name,
+                operation_type=op_type,
+                sample_type=sample_type
+            )
+
+            # Flush metrics to ensure they're queryable
+            self.metrics_store.flush()
+
     def _run_high_performance_benchmark(self):
         """
         Run benchmark using VDBBench-style ProcessPoolExecutor.
@@ -2276,23 +2809,42 @@ class WorkerCoordinator:
         # kNN queries with 768 floats = ~6KB uncompressed, ~1-2KB compressed
         os_client_options["http_compress"] = True
 
-        # Extract search parameters from test procedure
-        # Find the first search task
-        search_task = None
+        # Extract task parameters from test procedure
+        # Find the first benchmarkable task (search, bulk, etc.)
+        # Skip setup operations like create-index, warmup-knn-indices, force-merge
+        SETUP_OPERATIONS = {
+            "create-index", "delete-index", "warmup-knn-indices",
+            "force-merge", "refresh", "cluster-health", "sleep",
+            "create-knn-model", "delete-knn-model", "train-knn-model",
+        }
+
+        benchmark_task = None
         for task_group in self.test_procedure.schedule:
             for task in task_group:
                 op_type = task.operation.type if hasattr(task.operation, 'type') else task.operation.operation_type
-                if op_type in ["search", "vector-search"]:
-                    search_task = task
+                if op_type not in SETUP_OPERATIONS:
+                    benchmark_task = task
                     break
-            if search_task:
+            if benchmark_task:
                 break
 
-        if not search_task:
-            self.logger.error("No search task found in test procedure, falling back to legacy mode")
+        if not benchmark_task:
+            self.logger.error("No benchmarkable task found in test procedure, falling back to legacy mode")
             self.high_performance_mode = False
             self._start_benchmark_legacy()
             return
+
+        # Determine operation type
+        op_type = benchmark_task.operation.type if hasattr(benchmark_task.operation, 'type') else benchmark_task.operation.operation_type
+        is_vector_search = op_type == "vector-search"
+
+        # For non-vector-search operations, use the generic HP executor
+        if not is_vector_search:
+            self._run_generic_hp_benchmark(benchmark_task, host_list, os_client_options)
+            return
+
+        # Vector-search specific path follows below
+        search_task = benchmark_task
 
         # Get search parameters
         num_clients = search_task.clients
@@ -2307,22 +2859,27 @@ class WorkerCoordinator:
         # Merge params (task params override operation params)
         all_params = {**op_params, **task_params}
 
-        index = all_params.get("index", "target_index")
-        k = all_params.get("k", 100)
+        # Support both workload param names and custom HP mode param names
+        # Workload uses: target_index_name, target_field_name, query_k, id_field_name
+        # HP mode also accepts: index, field, k, id-field-name
+        index = all_params.get("target_index_name") or all_params.get("index", "target_index")
+        k = all_params.get("query_k") or all_params.get("k", 100)
         # Handle empty string as well as missing key
-        id_field = all_params.get("id-field-name") or "_id"
-        field_name = all_params.get("field", "embedding")
-        # HNSW ef_search at query time (None = use index default, VDBBench uses 100)
-        ef_search = all_params.get("hnsw_ef_search") or all_params.get("ef_search")
+        id_field = all_params.get("id_field_name") or all_params.get("id-field-name") or "_id"
+        field_name = all_params.get("target_field_name") or all_params.get("field", "embedding")
+        # HNSW ef_search at query time - VDBBench uses 100
+        # Default to 100 for HP mode to match VDBBench behavior
+        ef_search = all_params.get("hnsw_ef_search") or all_params.get("ef_search") or 100
 
         # Duration from warmup-time-period or default 30s
         duration = self.config.opts("workload", "warmup.time.period", mandatory=False, default_value=30)
 
-        # Dataset parameters
-        data_set_format = all_params.get("data_set_format") or "hdf5"
-        data_set_path = all_params.get("data_set_path") or None
-        data_set_corpus = all_params.get("data_set_corpus") or None
-        total_num_vectors = all_params.get("num_vectors", 10000)
+        # Dataset parameters - support both workload and custom param names
+        # Workload uses: query_data_set_format, query_data_set_path, query_data_set_corpus
+        data_set_format = all_params.get("query_data_set_format") or all_params.get("data_set_format") or "hdf5"
+        data_set_path = all_params.get("query_data_set_path") or all_params.get("data_set_path") or None
+        data_set_corpus = all_params.get("query_data_set_corpus") or all_params.get("data_set_corpus") or None
+        total_num_vectors = all_params.get("query_count") or all_params.get("num_vectors", 10000)
 
         # Load query vectors from dataset
         query_vectors = None
