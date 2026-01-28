@@ -287,11 +287,10 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
 
         try:
             # Build kNN query body with current vector
+            # Note: vectors are pre-converted to lists in coordinator to avoid
+            # numpy serialization and per-query .tolist() overhead
             if query_vectors is not None:
                 vector = query_vectors[query_idx]
-                # Convert numpy array to list if needed
-                if hasattr(vector, 'tolist'):
-                    vector = vector.tolist()
                 body = {
                     "size": k,
                     "query": {
@@ -2251,6 +2250,10 @@ class WorkerCoordinator:
                 for _ in range(vectors_to_load):
                     try:
                         vector = dataset.read(1)[0]
+                        # Pre-convert to Python list to avoid numpy serialization overhead
+                        # and per-query .tolist() calls in worker hot path
+                        if hasattr(vector, 'tolist'):
+                            vector = vector.tolist()
                         query_vectors.append(vector)
                     except StopIteration:
                         break
