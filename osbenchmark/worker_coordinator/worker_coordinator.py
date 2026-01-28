@@ -331,12 +331,16 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
             )
             latency = time.perf_counter() - t0
 
+            # Timestamp needed for time-series metrics (time.time() is ~0.5μs)
+            timestamp = time.time()
+
             # Only extract candidate_ids if needed for recall calculation
             # VDBBench doesn't use returned IDs during throughput testing
             if collect_ids:
                 hits = resp["hits"]["hits"]
                 candidate_ids = [str(h["fields"][id_field][0]) for h in hits] if hits else []
                 results.append({
+                    "timestamp": timestamp,
                     "latency_s": latency,
                     "candidate_ids": candidate_ids,
                     "query_idx": query_idx,
@@ -346,6 +350,7 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
             else:
                 # Minimal result for pure throughput (matches VDBBench hot path)
                 results.append({
+                    "timestamp": timestamp,
                     "latency_s": latency,
                     "success": True,
                     "took_ms": resp.get("took"),
@@ -353,8 +358,10 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
 
         except Exception as e:
             latency = time.perf_counter() - t0
+            timestamp = time.time()
             if collect_ids:
                 results.append({
+                    "timestamp": timestamp,
                     "latency_s": latency,
                     "candidate_ids": [],
                     "query_idx": query_idx,
@@ -363,6 +370,7 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
                 })
             else:
                 results.append({
+                    "timestamp": timestamp,
                     "latency_s": latency,
                     "success": False,
                     "error_type": type(e).__name__,
