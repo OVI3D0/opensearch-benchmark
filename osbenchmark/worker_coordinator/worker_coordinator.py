@@ -225,11 +225,15 @@ class TaskFinished:
 ##################################
 
 
-def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration,
+def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
+                    query_vectors=None, field_name="embedding", k=100,
                     id_field="_id", num_queries=None):
     """
     Worker function that runs in a separate process.
     Creates its own OpenSearch client and runs a tight query loop.
+
+    Cycles through query vectors to build kNN queries dynamically,
+    matching VDBBench's behavior for fair comparison.
 
     Returns results with candidate_ids for recall calculation.
 
@@ -240,8 +244,10 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration,
         hosts: OpenSearch host list
         client_options: Client configuration
         index: Index to search
-        body: Query body (will be cycled if num_queries provided)
         duration: How long to run (seconds)
+        query_vectors: List of query vectors (numpy arrays or lists)
+        field_name: Name of the vector field to query
+        k: Number of nearest neighbors to return
         id_field: Field name containing document ID (default: "_id")
         num_queries: Total number of unique queries (for cycling and recall matching)
     """
@@ -270,7 +276,8 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration,
 
     # Results list - each entry is a query result
     results = []
-    query_idx = worker_id % num_queries if num_queries else 0
+    num_vectors = len(query_vectors) if query_vectors else 1
+    query_idx = worker_id % num_vectors
     start_time = time.time()
     loop_start = time.perf_counter()
 
@@ -279,6 +286,27 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration,
         t0 = time.perf_counter()
 
         try:
+            # Build kNN query body with current vector
+            if query_vectors is not None:
+                vector = query_vectors[query_idx]
+                # Convert numpy array to list if needed
+                if hasattr(vector, 'tolist'):
+                    vector = vector.tolist()
+                body = {
+                    "size": k,
+                    "query": {
+                        "knn": {
+                            field_name: {
+                                "vector": vector,
+                                "k": k
+                            }
+                        }
+                    }
+                }
+            else:
+                # Fallback: match_all query if no vectors provided
+                body = {"size": k, "query": {"match_all": {}}}
+
             resp = os_client.search(
                 index=index,
                 body=body,
@@ -318,9 +346,8 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, body, duration,
                 "error_type": type(e).__name__,
             })
 
-        # Cycle through queries
-        if num_queries:
-            query_idx = (query_idx + 1) % num_queries
+        # Cycle through query vectors
+        query_idx = (query_idx + 1) % num_vectors
 
     end_time = time.time()
 
@@ -552,7 +579,8 @@ class HighPerformanceExecutor:
             num_clients=64,
             duration=30,
             index="my_index",
-            body={"query": {"knn": {...}}},
+            query_vectors=[...],  # List of query vectors
+            field_name="embedding",
             neighbors=[[id1, id2, ...], ...]  # ground truth per query
         )
     """
@@ -562,8 +590,8 @@ class HighPerformanceExecutor:
         self.client_options = client_options
         self.logger = logging.getLogger(__name__)
 
-    def run(self, num_clients, duration, index, body, k=100,
-            neighbors=None, id_field="_id", num_queries=None, quiet=False):
+    def run(self, num_clients, duration, index, query_vectors=None, field_name="embedding",
+            k=100, neighbors=None, id_field="_id", num_queries=None, quiet=False):
         """
         Run high-performance benchmark with full metrics.
 
@@ -571,8 +599,9 @@ class HighPerformanceExecutor:
             num_clients: Number of parallel worker processes
             duration: How long to run each worker (seconds)
             index: Index to query
-            body: Query body
-            k: Top-k for recall calculation
+            query_vectors: List of query vectors to cycle through
+            field_name: Name of the vector field to query
+            k: Top-k for kNN search and recall calculation
             neighbors: Ground truth - list of [id1, id2, ...] per query
             id_field: Field name containing document IDs
             num_queries: Number of unique queries (for cycling)
@@ -605,8 +634,10 @@ class HighPerformanceExecutor:
                     hosts=self.hosts,
                     client_options=self.client_options,
                     index=index,
-                    body=body,
                     duration=duration,
+                    query_vectors=query_vectors,
+                    field_name=field_name,
+                    k=k,
                     id_field=id_field,
                     num_queries=num_queries,
                 )
@@ -2175,20 +2206,81 @@ class WorkerCoordinator:
         all_params = {**op_params, **task_params}
 
         index = all_params.get("index", "target_index")
-        body = all_params.get("body", {"query": {"match_all": {}}})
         k = all_params.get("k", 100)
         # Handle empty string as well as missing key
         id_field = all_params.get("id-field-name") or "_id"
+        field_name = all_params.get("field", "embedding")
 
         # Duration from warmup-time-period or default 30s
         duration = self.config.opts("workload", "warmup.time.period", mandatory=False, default_value=30)
 
+        # Dataset parameters
+        data_set_format = all_params.get("data_set_format") or "hdf5"
+        data_set_path = all_params.get("data_set_path") or None
+        data_set_corpus = all_params.get("data_set_corpus") or None
+        total_num_vectors = all_params.get("num_vectors", 10000)
+
+        # Load query vectors from dataset
+        query_vectors = None
+        num_queries = None
+
+        # Try to resolve data_set_path from corpus if not provided directly
+        if not data_set_path and data_set_corpus:
+            self.logger.info("Resolving query vectors path from corpus: %s", data_set_corpus)
+            try:
+                for corpus in self.workload.corpora:
+                    if corpus.name == data_set_corpus:
+                        for document in corpus.documents:
+                            # Look for the query vectors file based on format
+                            if data_set_format == "hdf5" and hasattr(document, 'document_file'):
+                                data_set_path = document.document_file
+                                break
+                        break
+                if data_set_path:
+                    self.logger.info("Resolved corpus '%s' to path: %s", data_set_corpus, data_set_path)
+            except Exception as e:
+                self.logger.warning("Failed to resolve corpus path: %s", e)
+
+        if data_set_path:
+            self.logger.info("Loading query vectors from: %s", data_set_path)
+            try:
+                dataset = get_data_set(data_set_format, data_set_path, Context.QUERY)
+                query_vectors = []
+                dataset.seek(0)
+                vectors_to_load = total_num_vectors if total_num_vectors > 0 else 10000
+                for _ in range(vectors_to_load):
+                    try:
+                        vector = dataset.read(1)[0]
+                        query_vectors.append(vector)
+                    except StopIteration:
+                        break
+                num_queries = len(query_vectors)
+                self.logger.info("Loaded %d query vectors for benchmarking", num_queries)
+            except Exception as e:
+                self.logger.warning("Failed to load query vectors: %s. Using match_all queries.", e)
+                query_vectors = None
+        else:
+            self.logger.warning("No query vectors dataset provided. Using match_all queries (not realistic for kNN benchmark).")
+
         # Load ground truth neighbors for recall calculation
         neighbors = None
-        num_queries = None
         # Handle empty strings as well as missing keys
         neighbors_path = all_params.get("neighbors_data_set_path") or None
         neighbors_format = all_params.get("neighbors_data_set_format") or "hdf5"
+        neighbors_corpus = all_params.get("neighbors_data_set_corpus") or None
+
+        # Try to resolve neighbors path from corpus if not provided directly
+        if not neighbors_path and neighbors_corpus:
+            try:
+                for corpus in self.workload.corpora:
+                    if corpus.name == neighbors_corpus:
+                        for document in corpus.documents:
+                            if neighbors_format == "hdf5" and hasattr(document, 'document_file'):
+                                neighbors_path = document.document_file
+                                break
+                        break
+            except Exception as e:
+                self.logger.warning("Failed to resolve neighbors corpus path: %s", e)
 
         if neighbors_path:
             self.logger.info("Loading ground truth neighbors from: %s", neighbors_path)
@@ -2203,8 +2295,10 @@ class WorkerCoordinator:
                         neighbors.append([str(n) for n in neighbor[:k]])
                     except StopIteration:
                         break
-                num_queries = len(neighbors)
-                self.logger.info("Loaded %d ground truth neighbor sets for recall calculation", num_queries)
+                # Use neighbors count as num_queries if we didn't load query vectors
+                if num_queries is None:
+                    num_queries = len(neighbors)
+                self.logger.info("Loaded %d ground truth neighbor sets for recall calculation", len(neighbors))
             except Exception as e:
                 self.logger.warning("Failed to load neighbors dataset: %s. Recall will not be calculated.", e)
                 neighbors = None
@@ -2215,9 +2309,11 @@ class WorkerCoordinator:
         self.logger.info("  Hosts: %s", host_list)
         self.logger.info("  Clients: %d", num_clients)
         self.logger.info("  Index: %s", index)
+        self.logger.info("  Field: %s", field_name)
         self.logger.info("  Duration: %d seconds", duration)
         self.logger.info("  k: %d", k)
-        self.logger.info("  Ground truth queries: %s", num_queries or "N/A")
+        self.logger.info("  Query vectors: %s", num_queries or "N/A (using match_all)")
+        self.logger.info("  Ground truth neighbors: %s", len(neighbors) if neighbors else "N/A")
 
         # Run the benchmark
         executor = HighPerformanceExecutor(host_list, os_client_options)
@@ -2225,7 +2321,8 @@ class WorkerCoordinator:
             num_clients=num_clients,
             duration=duration,
             index=index,
-            body=body,
+            query_vectors=query_vectors,
+            field_name=field_name,
             k=k,
             neighbors=neighbors,
             id_field=id_field,
