@@ -659,6 +659,11 @@ def create_arg_parser():
         default=False,
         action="store_true")
     test_run_parser.add_argument(
+        "--high-performance-mode",
+        help="Uses ProcessPoolExecutor instead of Thespian actors for higher throughput benchmarks (default: false).",
+        default=False,
+        action="store_true")
+    test_run_parser.add_argument(
         "--enable-worker-coordinator-profiling",
         help="Enables a profiler for analyzing the performance of calls in OSB's worker coordinator (default: false).",
         default=False,
@@ -1116,6 +1121,7 @@ def configure_test(arg_parser, args, cfg):
     cfg.add(config.Scope.applicationOverride, "test_run", "user.tag", args.user_tag)
     cfg.add(config.Scope.applicationOverride, "worker_coordinator", "profiling", args.enable_worker_coordinator_profiling)
     cfg.add(config.Scope.applicationOverride, "worker_coordinator", "assertions", args.enable_assertions)
+    cfg.add(config.Scope.applicationOverride, "worker_coordinator", "high.performance.mode", args.high_performance_mode)
     cfg.add(config.Scope.applicationOverride, "worker_coordinator", "on.error", args.on_error)
     cfg.add(
         config.Scope.applicationOverride,
