@@ -227,14 +227,18 @@ class TaskFinished:
 
 def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
                     query_vectors=None, field_name="embedding", k=100,
-                    id_field="_id", num_queries=None):
+                    id_field="_id", num_queries=None,
+                    ready_queue=None, start_condition=None):
     """
     Worker function that runs in a separate process.
     Creates its own OpenSearch client and runs a tight query loop.
 
-    Cycles through pre-built query bodies for maximum performance.
-    Bodies are pre-built in the coordinator to eliminate dict construction
-    overhead in the hot path.
+    Cycles through query vectors and builds kNN query body dynamically,
+    matching VDBBench's approach. Vectors are pre-converted to Python lists
+    in the coordinator to minimize pickle overhead.
+
+    Uses synchronization barrier (ready_queue + start_condition) to ensure
+    all workers start simultaneously, matching VDBBench's pattern.
 
     Returns results with candidate_ids for recall calculation.
 
@@ -246,11 +250,13 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
         client_options: Client configuration
         index: Index to search
         duration: How long to run (seconds)
-        query_vectors: List of pre-built query body dicts (despite the name)
-        field_name: Unused (kept for API compatibility)
-        k: Used for fallback match_all query size
+        query_vectors: List of query vectors (Python lists, not numpy)
+        field_name: Name of the vector field for kNN query
+        k: Number of nearest neighbors to return
         id_field: Field name containing document ID (default: "_id")
         num_queries: Total number of unique queries (for cycling and recall matching)
+        ready_queue: Shared queue to signal worker is ready
+        start_condition: Shared condition to wait for synchronized start
     """
     import time
     import urllib3
@@ -267,6 +273,9 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
             **client_options
         )
     except Exception as e:
+        # Signal ready even on failure so coordinator doesn't hang
+        if ready_queue is not None:
+            ready_queue.put(worker_id)
         return {
             "worker_id": worker_id,
             "start_time": time.time(),
@@ -274,6 +283,12 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
             "results": [],
             "error": f"Failed to create client: {e}"
         }
+
+    # Synchronization barrier: signal ready and wait for all workers
+    if ready_queue is not None and start_condition is not None:
+        ready_queue.put(worker_id)
+        with start_condition:
+            start_condition.wait()
 
     # Results list - each entry is a query result
     results = []
@@ -287,10 +302,21 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
         t0 = time.perf_counter()
 
         try:
-            # Use pre-built query body (built in coordinator to avoid hot-path overhead)
-            # query_vectors is actually a list of pre-built body dicts
+            # Build query body from vector (same approach as VDBBench)
+            # Vectors are pre-converted to Python lists in coordinator
             if query_vectors is not None:
-                body = query_vectors[query_idx]
+                vector = query_vectors[query_idx]
+                body = {
+                    "size": k,
+                    "query": {
+                        "knn": {
+                            field_name: {
+                                "vector": vector,
+                                "k": k
+                            }
+                        }
+                    }
+                }
             else:
                 # Fallback: match_all query if no vectors provided
                 body = {"size": k, "query": {"match_all": {}}}
@@ -610,50 +636,73 @@ class HighPerformanceExecutor:
         progress_publisher = console.progress() if not quiet else None
         task_name = f"vector-search ({num_clients} clients)"
 
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=num_clients,
-            mp_context=mp_context
-        ) as executor:
-            # Submit all workers
-            futures = [
-                executor.submit(
-                    _hp_worker_loop,
-                    worker_id=i,
-                    hosts=self.hosts,
-                    client_options=self.client_options,
-                    index=index,
-                    duration=duration,
-                    query_vectors=query_vectors,
-                    field_name=field_name,
-                    k=k,
-                    id_field=id_field,
-                    num_queries=num_queries,
-                )
-                for i in range(num_clients)
-            ]
+        # Use Manager for synchronization primitives (like VDBBench)
+        with multiprocessing.Manager() as manager:
+            ready_queue = manager.Queue()
+            start_condition = manager.Condition()
 
-            # Show progress while waiting for results
-            start_time = time.perf_counter()
-            all_done = False
-            while not all_done:
-                # Check if any futures are still running
-                done_count = sum(1 for f in futures if f.done())
-                all_done = done_count == len(futures)
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=num_clients,
+                mp_context=mp_context
+            ) as executor:
+                # Submit all workers
+                futures = [
+                    executor.submit(
+                        _hp_worker_loop,
+                        worker_id=i,
+                        hosts=self.hosts,
+                        client_options=self.client_options,
+                        index=index,
+                        duration=duration,
+                        query_vectors=query_vectors,
+                        field_name=field_name,
+                        k=k,
+                        id_field=id_field,
+                        num_queries=num_queries,
+                        ready_queue=ready_queue,
+                        start_condition=start_condition,
+                    )
+                    for i in range(num_clients)
+                ]
 
-                if not all_done:
-                    # Show time-based progress
-                    elapsed = time.perf_counter() - start_time
-                    progress_pct = min(100, int((elapsed / duration) * 100))
-                    if progress_publisher:
-                        progress_publisher.print(f"Running {task_name}", f"[{progress_pct:3d}% done]")
-                    time.sleep(0.5)
+                # Wait for all workers to be ready (they've created clients and are waiting)
+                self.logger.info("Waiting for %d workers to initialize...", num_clients)
+                ready_count = 0
+                while ready_count < num_clients:
+                    try:
+                        ready_queue.get(timeout=60)  # 60s timeout per worker
+                        ready_count += 1
+                    except Exception:
+                        self.logger.warning("Timeout waiting for workers to initialize")
+                        break
 
-            if progress_publisher:
-                progress_publisher.print(f"Running {task_name}", "[100% done]")
-                progress_publisher.finish()
+                # Signal all workers to start simultaneously
+                self.logger.info("All workers ready, starting synchronized benchmark")
+                with start_condition:
+                    start_condition.notify_all()
 
-            # Collect results
-            worker_results = [f.result() for f in futures]
+                # Show progress while waiting for results
+                start_time = time.perf_counter()
+                all_done = False
+                while not all_done:
+                    # Check if any futures are still running
+                    done_count = sum(1 for f in futures if f.done())
+                    all_done = done_count == len(futures)
+
+                    if not all_done:
+                        # Show time-based progress
+                        elapsed = time.perf_counter() - start_time
+                        progress_pct = min(100, int((elapsed / duration) * 100))
+                        if progress_publisher:
+                            progress_publisher.print(f"Running {task_name}", f"[{progress_pct:3d}% done]")
+                        time.sleep(0.5)
+
+                if progress_publisher:
+                    progress_publisher.print(f"Running {task_name}", "[100% done]")
+                    progress_publisher.finish()
+
+                # Collect results
+                worker_results = [f.result() for f in futures]
 
         # Process metrics (runs in coordinator, no IPC)
         processor = MetricsProcessor(neighbors=neighbors, k=k)
@@ -2248,25 +2297,6 @@ class WorkerCoordinator:
                         break
                 num_queries = len(query_vectors)
                 self.logger.info("Loaded %d query vectors for benchmarking", num_queries)
-
-                # Pre-build query bodies to eliminate dict construction in hot path
-                # This is a key optimization - VDBBench-style pre-computation
-                query_bodies = []
-                for vector in query_vectors:
-                    query_bodies.append({
-                        "size": k,
-                        "query": {
-                            "knn": {
-                                field_name: {
-                                    "vector": vector,
-                                    "k": k
-                                }
-                            }
-                        }
-                    })
-                self.logger.info("Pre-built %d query bodies", len(query_bodies))
-                # Replace query_vectors with pre-built bodies
-                query_vectors = query_bodies
             except Exception as e:
                 self.logger.warning("Failed to load query vectors: %s. Using match_all queries.", e)
                 query_vectors = None
