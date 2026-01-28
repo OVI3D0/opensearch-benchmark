@@ -229,7 +229,7 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
                     query_vectors=None, field_name="embedding", k=100,
                     id_field="_id", num_queries=None,
                     ready_queue=None, start_condition=None,
-                    collect_ids=True):
+                    collect_ids=True, ef_search=None):
     """
     Worker function that runs in a separate process.
     Creates its own OpenSearch client and runs a tight query loop.
@@ -259,6 +259,7 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
         ready_queue: Shared queue to signal worker is ready
         start_condition: Shared condition to wait for synchronized start
         collect_ids: Whether to extract candidate IDs (for recall). Set False for pure throughput.
+        ef_search: HNSW ef_search parameter for query-time (None = use index default)
     """
     import time
     import urllib3
@@ -311,14 +312,14 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
             try:
                 if query_vectors is not None:
                     vector = query_vectors[query_idx]
+                    knn_params = {"vector": vector, "k": k}
+                    if ef_search is not None:
+                        knn_params["method_parameters"] = {"ef_search": ef_search}
                     body = {
                         "size": k,
                         "query": {
                             "knn": {
-                                field_name: {
-                                    "vector": vector,
-                                    "k": k
-                                }
+                                field_name: knn_params
                             }
                         }
                     }
@@ -364,14 +365,14 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
             try:
                 if query_vectors is not None:
                     vector = query_vectors[query_idx]
+                    knn_params = {"vector": vector, "k": k}
+                    if ef_search is not None:
+                        knn_params["method_parameters"] = {"ef_search": ef_search}
                     body = {
                         "size": k,
                         "query": {
                             "knn": {
-                                field_name: {
-                                    "vector": vector,
-                                    "k": k
-                                }
+                                field_name: knn_params
                             }
                         }
                     }
@@ -655,7 +656,7 @@ class HighPerformanceExecutor:
         self.logger = logging.getLogger(__name__)
 
     def run(self, num_clients, duration, index, query_vectors=None, field_name="embedding",
-            k=100, neighbors=None, id_field="_id", num_queries=None, quiet=False):
+            k=100, neighbors=None, id_field="_id", num_queries=None, quiet=False, ef_search=None):
         """
         Run high-performance benchmark with full metrics.
 
@@ -670,6 +671,7 @@ class HighPerformanceExecutor:
             id_field: Field name containing document IDs
             num_queries: Number of unique queries (for cycling)
             quiet: If True, suppress progress output
+            ef_search: HNSW ef_search parameter for query-time (None = use index default)
 
         Returns:
             dict with full metrics from MetricsProcessor
@@ -717,6 +719,7 @@ class HighPerformanceExecutor:
                         ready_queue=ready_queue,
                         start_condition=start_condition,
                         collect_ids=collect_ids,
+                        ef_search=ef_search,
                     )
                     for i in range(num_clients)
                 ]
@@ -2309,6 +2312,8 @@ class WorkerCoordinator:
         # Handle empty string as well as missing key
         id_field = all_params.get("id-field-name") or "_id"
         field_name = all_params.get("field", "embedding")
+        # HNSW ef_search at query time (None = use index default, VDBBench uses 100)
+        ef_search = all_params.get("hnsw_ef_search") or all_params.get("ef_search")
 
         # Duration from warmup-time-period or default 30s
         duration = self.config.opts("workload", "warmup.time.period", mandatory=False, default_value=30)
@@ -2415,9 +2420,10 @@ class WorkerCoordinator:
         self.logger.info("  Field: %s", field_name)
         self.logger.info("  Duration: %d seconds", duration)
         self.logger.info("  k: %d", k)
+        self.logger.info("  ef_search: %s", ef_search or "index default")
         self.logger.info("  Query vectors: %s", num_queries or "N/A (using match_all)")
         self.logger.info("  Ground truth neighbors: %s", len(neighbors) if neighbors else "N/A")
-        self.logger.info("  Client options: %s", {k: v for k, v in os_client_options.items() if k != "http_auth"})
+        self.logger.info("  Client options: %s", {kk: v for kk, v in os_client_options.items() if kk != "http_auth"})
 
         # Run the benchmark
         executor = HighPerformanceExecutor(host_list, os_client_options)
@@ -2432,6 +2438,7 @@ class WorkerCoordinator:
             id_field=id_field,
             num_queries=num_queries,
             quiet=self.quiet,
+            ef_search=ef_search,
         )
 
         # Extract metrics for logging and storage
