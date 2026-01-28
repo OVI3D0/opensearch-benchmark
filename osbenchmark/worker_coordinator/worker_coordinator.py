@@ -232,8 +232,9 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
     Worker function that runs in a separate process.
     Creates its own OpenSearch client and runs a tight query loop.
 
-    Cycles through query vectors to build kNN queries dynamically,
-    matching VDBBench's behavior for fair comparison.
+    Cycles through pre-built query bodies for maximum performance.
+    Bodies are pre-built in the coordinator to eliminate dict construction
+    overhead in the hot path.
 
     Returns results with candidate_ids for recall calculation.
 
@@ -245,9 +246,9 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
         client_options: Client configuration
         index: Index to search
         duration: How long to run (seconds)
-        query_vectors: List of query vectors (numpy arrays or lists)
-        field_name: Name of the vector field to query
-        k: Number of nearest neighbors to return
+        query_vectors: List of pre-built query body dicts (despite the name)
+        field_name: Unused (kept for API compatibility)
+        k: Used for fallback match_all query size
         id_field: Field name containing document ID (default: "_id")
         num_queries: Total number of unique queries (for cycling and recall matching)
     """
@@ -286,22 +287,10 @@ def _hp_worker_loop(worker_id, hosts, client_options, index, duration,
         t0 = time.perf_counter()
 
         try:
-            # Build kNN query body with current vector
-            # Note: vectors are pre-converted to lists in coordinator to avoid
-            # numpy serialization and per-query .tolist() overhead
+            # Use pre-built query body (built in coordinator to avoid hot-path overhead)
+            # query_vectors is actually a list of pre-built body dicts
             if query_vectors is not None:
-                vector = query_vectors[query_idx]
-                body = {
-                    "size": k,
-                    "query": {
-                        "knn": {
-                            field_name: {
-                                "vector": vector,
-                                "k": k
-                            }
-                        }
-                    }
-                }
+                body = query_vectors[query_idx]
             else:
                 # Fallback: match_all query if no vectors provided
                 body = {"size": k, "query": {"match_all": {}}}
@@ -2259,6 +2248,25 @@ class WorkerCoordinator:
                         break
                 num_queries = len(query_vectors)
                 self.logger.info("Loaded %d query vectors for benchmarking", num_queries)
+
+                # Pre-build query bodies to eliminate dict construction in hot path
+                # This is a key optimization - VDBBench-style pre-computation
+                query_bodies = []
+                for vector in query_vectors:
+                    query_bodies.append({
+                        "size": k,
+                        "query": {
+                            "knn": {
+                                field_name: {
+                                    "vector": vector,
+                                    "k": k
+                                }
+                            }
+                        }
+                    })
+                self.logger.info("Pre-built %d query bodies", len(query_bodies))
+                # Replace query_vectors with pre-built bodies
+                query_vectors = query_bodies
             except Exception as e:
                 self.logger.warning("Failed to load query vectors: %s. Using match_all queries.", e)
                 query_vectors = None
