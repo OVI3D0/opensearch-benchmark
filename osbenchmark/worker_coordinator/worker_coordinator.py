@@ -1373,6 +1373,9 @@ def calculate_worker_assignments(host_configs, client_count):
     """
     Assigns clients to workers on the provided hosts.
 
+    Each client gets its own dedicated worker process for true parallelism.
+    This eliminates GIL contention and provides accurate latency measurements.
+
     :param host_configs: A list of dicts where each dict contains the host name (key: ``host``) and the number of
                          available CPU cores (key: ``cores``).
     :param client_count: The number of clients that should be used at most.
@@ -1380,13 +1383,12 @@ def calculate_worker_assignments(host_configs, client_count):
              in that list contains another list with the clients that should be assigned to these workers.
     """
     assignments = []
-    client_idx = 0
     host_count = len(host_configs)
     clients_per_host = math.ceil(client_count / host_count)
     remaining_clients = client_count
+    client_idx = 0
+
     for host_config in host_configs:
-        # the last host might not need to simulate as many clients as the rest of the hosts as we eagerly
-        # assign clients to hosts.
         clients_on_this_host = min(clients_per_host, remaining_clients)
         assignment = {
             "host": host_config["host"],
@@ -1394,20 +1396,12 @@ def calculate_worker_assignments(host_configs, client_count):
         }
         assignments.append(assignment)
 
-        workers_on_this_host = host_config["cores"]
-        clients_per_worker = [0] * workers_on_this_host
-
-        # determine how many clients each worker should simulate
-        for c in range(clients_on_this_host):
-            clients_per_worker[c % workers_on_this_host] += 1
-
-        # assign client ids to workers
-        for client_count_for_worker in clients_per_worker:
-            worker_assignment = []
-            assignment["workers"].append(worker_assignment)
-            for c in range(client_idx, client_idx + client_count_for_worker):
-                worker_assignment.append(c)
-            client_idx += client_count_for_worker
+        # Create 1 worker per client (not based on CPU cores)
+        # This provides true parallelism - each worker is a separate process
+        for _ in range(clients_on_this_host):
+            # Each worker gets exactly 1 client
+            assignment["workers"].append([client_idx])
+            client_idx += 1
 
         remaining_clients -= clients_on_this_host
 
@@ -1619,11 +1613,15 @@ class Worker(actor.BenchmarkActor):
                 self.logger.info("Worker[%d] skips tasks at index [%d] because it has been asked to complete all "
                                  "tasks until next join point.", self.worker_id, self.current_task_index)
             else:
-                self.logger.info("Worker[%d] is executing tasks at index [%d].", self.worker_id, self.current_task_index)
+                self.logger.info("Worker[%d] is executing tasks at index [%d] for client [%d].",
+                                self.worker_id, self.current_task_index, task_allocations[0].client_id)
                 self.sampler = DefaultSampler(start_timestamp=time.perf_counter(), buffer_size=self.sample_queue_size)
-                self.profile_sampler = ProfileMetricsSampler(start_timestamp=time.perf_counter(), buffer_size=self.sample_queue_size)
-                executor = AsyncIoAdapter(self.config, self.workload, task_allocations, self.sampler, self.profile_sampler,
-                                          self.cancel, self.complete, self.on_error, self.shared_states, self.feedback_actor, self.error_queue, self.queue_lock)
+
+                executor = SyncIoAdapter(
+                    self.config, self.workload, task_allocations[0],
+                    self.sampler, self.cancel, self.complete, self.on_error,
+                    self.shared_states, self.feedback_actor, self.error_queue, self.queue_lock
+                )
 
                 self.executor_future = self.pool.submit(executor)
                 self.wakeupAfter(datetime.timedelta(seconds=self.wakeup_interval))
@@ -2175,6 +2173,396 @@ async def execute_single(runner, opensearch, params, on_error, redline_enabled=F
         request_context_holder.on_request_end()
         request_context_holder.on_client_request_end()
     return total_ops, total_ops_unit, request_meta_data
+
+
+def execute_single_sync(runner, opensearch, params, on_error, redline_enabled=False, client_enabled=True):
+    """
+    Synchronous version of execute_single. Invokes the given runner once.
+
+    :return: a triple of: total number of operations, unit of operations, a dict of request meta data (may be None).
+    """
+    # pylint: disable=import-outside-toplevel
+    import opensearchpy
+    fatal_error = False
+    if client_enabled:
+        try:
+            with runner:
+                return_value = runner(opensearch, params)
+            if isinstance(return_value, tuple) and len(return_value) == 2:
+                total_ops, total_ops_unit = return_value
+                request_meta_data = {"success": True}
+            elif isinstance(return_value, dict):
+                total_ops = return_value.pop("weight", 1)
+                total_ops_unit = return_value.pop("unit", "ops")
+                request_meta_data = return_value
+                if "success" not in request_meta_data:
+                    request_meta_data["success"] = True
+            else:
+                total_ops = 1
+                total_ops_unit = "ops"
+                request_meta_data = {"success": True}
+        except opensearchpy.TransportError as e:
+            request_context_holder.on_client_request_end()
+            if type(e) is opensearchpy.ConnectionError:
+                fatal_error = True
+
+            total_ops = 0
+            total_ops_unit = "ops"
+            request_meta_data = {
+                "success": False,
+                "error-type": "transport"
+            }
+            if isinstance(e.status_code, int):
+                request_meta_data["http-status"] = e.status_code
+            if isinstance(e, opensearchpy.ConnectionTimeout):
+                request_meta_data["error-description"] = "network connection timed out"
+            elif e.info:
+                request_meta_data["error-description"] = f"{e.error} ({e.info})"
+            else:
+                if isinstance(e.error, bytes):
+                    error_description = e.error.decode("utf-8")
+                else:
+                    error_description = str(e.error)
+                request_meta_data["error-description"] = error_description
+        except KeyError as e:
+            request_context_holder.on_client_request_end()
+            logging.getLogger(__name__).exception("Cannot execute runner [%s]; most likely due to missing parameters.", str(runner))
+            msg = "Cannot execute [%s]. Provided parameters are: %s. Error: [%s]." % (str(runner), list(params.keys()), str(e))
+            if not redline_enabled:
+                console.error(msg)
+                raise exceptions.SystemSetupError(msg)
+
+        if not request_meta_data["success"]:
+            if on_error == "abort" or fatal_error:
+                msg = "Request returned an error. Error type: %s" % request_meta_data.get("error-type", "Unknown")
+                description = request_meta_data.get("error-description")
+                if description:
+                    msg += ", Description: %s" % description
+                    if not redline_enabled:
+                        console.error(msg)
+                if not redline_enabled:
+                    raise exceptions.BenchmarkAssertionError(msg)
+
+            if 'error-description' in request_meta_data:
+                try:
+                    error_metadata = json.loads(request_meta_data["error-description"])
+                    opensearch_operation_error = parse_error(error_metadata)
+                    if not redline_enabled:
+                        console.error(opensearch_operation_error.get_error_message())
+                except Exception:
+                    if not redline_enabled:
+                        console.error(request_meta_data["error-description"])
+                if not redline_enabled:
+                    logging.getLogger(__name__).error(request_meta_data["error-description"])
+    else:
+        request_context_holder.on_client_request_start()
+        request_context_holder.on_request_start()
+        total_ops = 0
+        total_ops_unit = "ops"
+        request_meta_data = {
+            "success": True,
+            "skipped_request": True
+        }
+        request_context_holder.on_request_end()
+        request_context_holder.on_client_request_end()
+    return total_ops, total_ops_unit, request_meta_data
+
+
+class SyncExecutor:
+    """
+    Synchronous executor that runs one client per worker process.
+
+    Unlike AsyncExecutor which shares an event loop with multiple clients,
+    SyncExecutor uses a synchronous OpenSearch client and blocks on I/O.
+    This provides true parallelism when each worker is in its own process,
+    resulting in significantly higher throughput and accurate latency measurements.
+
+    Key differences from AsyncExecutor:
+    - Uses synchronous OpenSearch client (urllib3-based)
+    - Blocks on I/O (OS-level, not Python event loop)
+    - One client per worker (no GIL contention)
+    - Uses time.sleep() for throttling instead of asyncio.sleep()
+    """
+
+    def __init__(self, client_id, task, schedule, opensearch, sampler, cancel, complete, on_error,
+                 cfg=None, shared_states=None, feedback_actor=None, error_queue=None, queue_lock=None):
+        self.client_id = client_id
+        self.task = task
+        self.op = task.operation
+        self.schedule_handle = schedule
+        self.opensearch = opensearch
+        self.sampler = sampler
+        self.cancel = cancel
+        self.complete = complete
+        self.on_error = on_error
+        self.logger = logging.getLogger(__name__)
+        self.cfg = cfg
+        self.shared_states = shared_states
+        self.feedback_actor = feedback_actor
+        self.error_queue = error_queue
+        self.queue_lock = queue_lock
+        self.redline_enabled = self.cfg.opts("workload", "redline.test", mandatory=False) if self.cfg else False
+
+        self.client_options = self._get_client_options()
+        self.base_timeout = int(self.client_options.get("timeout", 10))
+
+        self.expected_scheduled_time = 0
+        self.sample_type = None
+        self.runner = None
+        self.task_completes_parent = False
+
+    def _get_client_options(self) -> dict:
+        try:
+            if self.cfg is not None:
+                client_options_obj = self.cfg.opts("client", "options")
+                return client_options_obj.default or {}
+            else:
+                return {}
+        except exceptions.ConfigError:
+            return {}
+
+    def _wait_for_rampup(self, rampup_wait_time: float) -> None:
+        """Wait for the ramp-up phase if needed (synchronous)."""
+        if rampup_wait_time:
+            self.logger.info("Client id [%s] waiting [%.2f]s for ramp-up.", self.client_id, rampup_wait_time)
+            time.sleep(rampup_wait_time)
+            self.logger.info("Client id [%s] is running now.", self.client_id)
+
+    def _execute_request(self, params: dict, expected_scheduled_time: float, total_start: float,
+                         client_state: bool) -> dict:
+        """Execute a request with timing control and error handling (synchronous)."""
+        request_timeout = (params or {}).get("request-timeout", None)
+        absolute_expected_schedule_time = total_start + expected_scheduled_time
+        throughput_throttled = expected_scheduled_time > 0
+
+        # Throttle to match schedule (synchronous sleep)
+        if throughput_throttled:
+            rest = absolute_expected_schedule_time - time.perf_counter()
+            if rest > 0:
+                time.sleep(rest)
+
+        absolute_processing_start = time.time()
+        processing_start = time.perf_counter()
+        self.schedule_handle.before_request(processing_start)
+
+        request_start = request_end = client_request_start = client_request_end = None
+        total_ops, total_ops_unit, request_meta_data = 0, "ops", {}
+
+        # Execute synchronously
+        client_request_start = time.perf_counter()
+        request_start = client_request_start
+        try:
+            total_ops, total_ops_unit, request_meta_data = execute_single_sync(
+                self.runner, self.opensearch, params, self.on_error,
+                redline_enabled=self.redline_enabled, client_enabled=client_state
+            )
+        except Exception as e:
+            self.logger.error("Client %s request failed: %s", self.client_id, e)
+            request_meta_data = {"success": False, "error-type": "exception", "error-description": str(e)}
+
+        request_end = time.perf_counter()
+        client_request_end = request_end
+
+        if not request_meta_data.get("success") and not request_meta_data.get("skipped", False):
+            error_info = {
+                "client_id": self.client_id,
+                "task": str(self.task),
+                "error_details": request_meta_data
+            }
+            self.report_error(error_info)
+
+        processing_end = time.perf_counter()
+
+        return {
+            "absolute_processing_start": absolute_processing_start,
+            "processing_start": processing_start,
+            "processing_end": processing_end,
+            "request_start": request_start,
+            "request_end": request_end,
+            "client_request_start": client_request_start,
+            "client_request_end": client_request_end,
+            "total_ops": total_ops,
+            "total_ops_unit": total_ops_unit,
+            "request_meta_data": request_meta_data,
+            "throughput_throttled": throughput_throttled
+        }
+
+    def _process_results(self, result_data: dict, total_start: float, client_state: bool,
+                         task_progress: tuple) -> bool:
+        """Process results from a request."""
+        if result_data["request_meta_data"].get("skipped_request"):
+            self.schedule_handle.after_request(
+                result_data["processing_end"], 0, "ops", {"success": False, "skipped": True}
+            )
+            return self.complete.is_set()
+
+        service_time = result_data["request_end"] - result_data["request_start"]
+        client_processing_time = (result_data["client_request_end"] - result_data["client_request_start"]) - service_time
+        processing_time = result_data["processing_end"] - result_data["processing_start"]
+        time_period = result_data["request_end"] - total_start
+
+        self.schedule_handle.after_request(
+            result_data["processing_end"],
+            result_data["total_ops"],
+            result_data["total_ops_unit"],
+            result_data["request_meta_data"]
+        )
+
+        throughput = result_data["request_meta_data"].pop("throughput", None)
+        latency = (result_data["request_end"] - (total_start + self.expected_scheduled_time)
+                   if result_data["throughput_throttled"] else service_time)
+
+        runner_completed = getattr(self.runner, "completed", False)
+        runner_task_progress = getattr(self.runner, "task_progress", None)
+
+        if self.task_completes_parent:
+            completed = runner_completed
+        else:
+            completed = self.complete.is_set() or runner_completed
+
+        if completed:
+            progress = 1.0
+        elif runner_task_progress is not None:
+            progress = runner_task_progress
+        else:
+            progress = task_progress
+
+        if client_state:
+            self.sampler.add(
+                self.task, self.client_id, self.sample_type,
+                result_data["request_meta_data"],
+                result_data["absolute_processing_start"],
+                result_data["request_start"],
+                latency, service_time, client_processing_time, processing_time,
+                throughput, result_data["total_ops"], result_data["total_ops_unit"],
+                time_period, progress,
+                result_data["request_meta_data"].pop("dependent_timing", None)
+            )
+        return completed
+
+    def report_error(self, error_info: dict) -> None:
+        """Report an error to the error queue."""
+        if self.error_queue is not None:
+            try:
+                self.error_queue.put_nowait(error_info)
+            except queue.Full:
+                self.logger.warning("Error queue full; dropping error from client %s", self.client_id)
+
+    def __call__(self, *args, **kwargs):
+        """Main execution loop (synchronous)."""
+        self.task_completes_parent = self.task.completes_parent
+        total_start = time.perf_counter()
+
+        self.logger.debug("SyncExecutor: Initializing schedule for client id [%s].", self.client_id)
+
+        # Use synchronous iteration over the schedule
+        self.schedule_handle.start()
+        rampup_wait_time = self.schedule_handle.ramp_up_wait_time
+
+        self._wait_for_rampup(rampup_wait_time)
+
+        self.logger.debug("SyncExecutor: Entering main loop for client id [%s].", self.client_id)
+
+        try:
+            # Iterate synchronously over the schedule
+            for expected_scheduled_time, sample_type, task_progress, current_runner, params in self.schedule_handle:
+                self.expected_scheduled_time = expected_scheduled_time
+                self.sample_type = sample_type
+                self.runner = current_runner
+
+                if self.cancel.is_set():
+                    self.logger.info("User cancelled execution.")
+                    break
+
+                client_state = (self.shared_states or {}).get(self.client_id, True)
+
+                result_data = self._execute_request(params, expected_scheduled_time, total_start, client_state)
+                completed = self._process_results(result_data, total_start, client_state, task_progress)
+
+                if completed:
+                    self.logger.info("Task [%s] is considered completed due to external event.", self.task)
+                    break
+
+        except BaseException as e:
+            self.logger.exception("Could not execute schedule")
+            raise exceptions.BenchmarkError(f"Cannot run task [{self.task}]: {e}") from None
+        finally:
+            if self.task_completes_parent:
+                self.logger.info(
+                    "Task [%s] completes parent. Client id [%s] is finished executing it and signals completion.",
+                    self.task, self.client_id
+                )
+                self.complete.set()
+
+        run_end = time.perf_counter()
+        self.logger.info("SyncExecutor client [%s] completed. Total run duration: %.3f seconds.",
+                        self.client_id, run_end - total_start)
+
+
+class SyncIoAdapter:
+    """
+    Adapter that creates a synchronous OpenSearch client and runs SyncExecutor.
+
+    This replaces AsyncIoAdapter for single-client workers, providing true
+    parallelism by using blocking I/O instead of async/await.
+    """
+
+    def __init__(self, cfg, workload, task_allocation, sampler, cancel, complete, abort_on_error,
+                 shared_states=None, feedback_actor=None, error_queue=None, queue_lock=None):
+        self.cfg = cfg
+        self.workload = workload
+        # Single task allocation (client_id, task)
+        self.client_id, self.task_allocation = task_allocation
+        self.sampler = sampler
+        self.cancel = cancel
+        self.complete = complete
+        self.abort_on_error = abort_on_error
+        self.logger = logging.getLogger(__name__)
+        self.shared_states = shared_states
+        self.feedback_actor = feedback_actor
+        self.error_queue = error_queue
+        self.queue_lock = queue_lock
+
+    def __call__(self, *args, **kwargs):
+        """Create sync client and run SyncExecutor."""
+
+        def create_os_client(all_hosts, all_client_options):
+            """Create synchronous OpenSearch client."""
+            opensearch = {}
+            for cluster_name, cluster_hosts in all_hosts.items():
+                client_factory = client.OsClientFactory(cluster_hosts, all_client_options[cluster_name])
+                opensearch[cluster_name] = client_factory.create()
+            return opensearch
+
+        # Create synchronous client with connection pool size of 1 (single client)
+        opensearch = create_os_client(
+            self.cfg.opts("client", "hosts").all_hosts,
+            self.cfg.opts("client", "options").with_max_connections(1)
+        )
+
+        assertions_enabled = self.cfg.opts("worker_coordinator", "assertions")
+        self.logger.info("SyncIoAdapter: Task assertions enabled: %s", str(assertions_enabled))
+        runner.enable_assertions(assertions_enabled)
+
+        task = self.task_allocation.task
+        param_source = workload.operation_parameters(self.workload, task)
+        schedule = schedule_for(self.task_allocation, param_source)
+
+        executor = SyncExecutor(
+            self.client_id, task, schedule, opensearch, self.sampler,
+            self.cancel, self.complete, task.error_behavior(self.abort_on_error),
+            self.cfg, self.shared_states, self.feedback_actor, self.error_queue, self.queue_lock
+        )
+
+        try:
+            executor()
+        finally:
+            # Close sync client connections
+            for os_client in opensearch.values():
+                try:
+                    os_client.close()
+                except Exception as e:
+                    self.logger.warning("Error closing OpenSearch client: %s", e)
 
 
 class JoinPoint:

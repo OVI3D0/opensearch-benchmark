@@ -416,6 +416,14 @@ class SamplePostprocessorTests(TestCase):
 
 
 class WorkerAssignmentTests(TestCase):
+    """
+    Tests for calculate_worker_assignments.
+
+    The new implementation creates 1 worker per client for true parallelism.
+    Each worker gets exactly 1 client (no multiple clients per worker, no empty workers).
+    This eliminates GIL contention and provides accurate latency measurements.
+    """
+
     def test_single_host_assignment_clients_matches_cores(self):
         host_configs = [{
             "host": "localhost",
@@ -424,6 +432,7 @@ class WorkerAssignmentTests(TestCase):
 
         assignments = worker_coordinator.calculate_worker_assignments(host_configs, client_count=4)
 
+        # 4 clients = 4 workers, each with 1 client
         self.assertEqual([
             {
                 "host": "localhost",
@@ -444,12 +453,15 @@ class WorkerAssignmentTests(TestCase):
 
         assignments = worker_coordinator.calculate_worker_assignments(host_configs, client_count=6)
 
+        # 6 clients = 6 workers (1 per client, ignoring core count)
         self.assertEqual([
             {
                 "host": "localhost",
                 "workers": [
-                    [0, 1],
-                    [2, 3],
+                    [0],
+                    [1],
+                    [2],
+                    [3],
                     [4],
                     [5]
                 ]
@@ -464,14 +476,13 @@ class WorkerAssignmentTests(TestCase):
 
         assignments = worker_coordinator.calculate_worker_assignments(host_configs, client_count=2)
 
+        # 2 clients = 2 workers (no empty workers)
         self.assertEqual([
             {
                 "host": "localhost",
                 "workers": [
                     [0],
-                    [1],
-                    [],
-                    []
+                    [1]
                 ]
             }
         ], assignments)
@@ -490,23 +501,32 @@ class WorkerAssignmentTests(TestCase):
 
         assignments = worker_coordinator.calculate_worker_assignments(host_configs, client_count=16)
 
+        # 16 clients = 16 workers (8 per host), each with 1 client
         self.assertEqual([
             {
                 "host": "host-a",
                 "workers": [
-                    [0, 1],
-                    [2, 3],
-                    [4, 5],
-                    [6, 7]
+                    [0],
+                    [1],
+                    [2],
+                    [3],
+                    [4],
+                    [5],
+                    [6],
+                    [7]
                 ]
             },
             {
                 "host": "host-b",
                 "workers": [
-                    [8, 9],
-                    [10, 11],
-                    [12, 13],
-                    [14, 15]
+                    [8],
+                    [9],
+                    [10],
+                    [11],
+                    [12],
+                    [13],
+                    [14],
+                    [15]
                 ]
             }
         ], assignments)
@@ -525,23 +545,20 @@ class WorkerAssignmentTests(TestCase):
 
         assignments = worker_coordinator.calculate_worker_assignments(host_configs, client_count=4)
 
+        # 4 clients = 4 workers (2 per host), no empty workers
         self.assertEqual([
             {
                 "host": "host-a",
                 "workers": [
                     [0],
-                    [1],
-                    [],
-                    []
+                    [1]
                 ]
             },
             {
                 "host": "host-b",
                 "workers": [
                     [2],
-                    [3],
-                    [],
-                    []
+                    [3]
                 ]
             }
         ], assignments)
@@ -564,12 +581,16 @@ class WorkerAssignmentTests(TestCase):
 
         assignments = worker_coordinator.calculate_worker_assignments(host_configs, client_count=17)
 
+        # 17 clients across 3 hosts = ceil(17/3) = 6 per host (last host gets 5)
+        # Each worker gets 1 client
         self.assertEqual([
             {
                 "host": "host-a",
                 "workers": [
-                    [0, 1],
-                    [2, 3],
+                    [0],
+                    [1],
+                    [2],
+                    [3],
                     [4],
                     [5]
                 ]
@@ -577,8 +598,10 @@ class WorkerAssignmentTests(TestCase):
             {
                 "host": "host-b",
                 "workers": [
-                    [6, 7],
-                    [8, 9],
+                    [6],
+                    [7],
+                    [8],
+                    [9],
                     [10],
                     [11]
                 ]
@@ -586,7 +609,8 @@ class WorkerAssignmentTests(TestCase):
             {
                 "host": "host-c",
                 "workers": [
-                    [12, 13],
+                    [12],
+                    [13],
                     [14],
                     [15],
                     [16]
