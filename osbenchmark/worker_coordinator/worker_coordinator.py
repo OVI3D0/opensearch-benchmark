@@ -2880,6 +2880,36 @@ class ScheduleHandle:
                 except StopIteration:
                     return
 
+    def __iter__(self):
+        """
+        Synchronous iterator for use with SyncExecutor.
+        Mirrors the async __call__ method but for regular for-loops.
+        """
+        next_scheduled = 0
+        if self.task_progress_control.infinite:
+            param_source_knows_progress = hasattr(self.params, "task_progress")
+            while True:
+                try:
+                    next_scheduled = self.sched.next(next_scheduled)
+                    task_progress = self.params.task_progress if param_source_knows_progress else None
+                    yield (next_scheduled, self.task_progress_control.sample_type, task_progress, self.runner,
+                           self.params.params())
+                    self.task_progress_control.next()
+                except StopIteration:
+                    return
+        else:
+            while not self.task_progress_control.completed:
+                try:
+                    next_scheduled = self.sched.next(next_scheduled)
+                    yield (next_scheduled,
+                           self.task_progress_control.sample_type,
+                           self.task_progress_control.task_progress,
+                           self.runner,
+                           self.params.params())
+                    self.task_progress_control.next()
+                except StopIteration:
+                    return
+
 
 class TimePeriodBased:
     def __init__(self, warmup_time_period, time_period):
