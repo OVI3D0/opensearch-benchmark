@@ -1126,7 +1126,9 @@ class WorkerCoordinator:
             "reporting", "metrics.request.downsample.factor",
             mandatory=False, default_value=1))
         self.target.send(self.target.metrics_actor, StartMetricsActor(
-            metrics_store=self.metrics_store,
+            config=self.config,
+            workload_name=self.workload.name,
+            test_procedure_name=self.test_procedure.name,
             downsample_factor=downsample_factor,
             workload_meta_data=self.workload.meta_data,
             test_procedure_meta_data=self.test_procedure.meta_data,

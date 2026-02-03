@@ -33,7 +33,7 @@ from typing import List, Optional, Any
 
 import thespian.actors
 
-from osbenchmark import actor
+from osbenchmark import actor, config, metrics, paths
 from osbenchmark.utils import convert
 
 
@@ -45,8 +45,15 @@ from osbenchmark.utils import convert
 
 @dataclass
 class StartMetricsActor:
-    """Initialize the MetricsActor with configuration."""
-    metrics_store: Any
+    """Initialize the MetricsActor with configuration.
+
+    Note: We pass config info instead of metrics_store because metrics_store
+    contains SSL connections that can't be pickled for Thespian message passing.
+    MetricsActor creates its own metrics_store connection.
+    """
+    config: Any  # OSB config object (serializable)
+    workload_name: str
+    test_procedure_name: str
     downsample_factor: int
     workload_meta_data: dict
     test_procedure_meta_data: dict
@@ -132,21 +139,37 @@ class MetricsActor(actor.BenchmarkActor):
         self.processing_start_time = None
         self.is_running = False
 
+    def _load_local_config(self, coordinator_config):
+        """Load local config from coordinator config (same as workers do)."""
+        cfg = config.auto_load_local_config(coordinator_config, additional_sections=[
+            "workload", "worker_coordinator", "client", "builder", "telemetry", "reporting"
+        ])
+        cfg.add(config.Scope.application, "node", "benchmark.root", paths.benchmark_root())
+        return cfg
+
     def receiveMsg_StartMetricsActor(self, msg, sender):
         """Initialize the actor with metrics configuration."""
         self.logger.info("MetricsActor starting with downsample_factor=%d", msg.downsample_factor)
 
-        self.metrics_store = msg.metrics_store
+        # Load local config and create our own metrics_store connection
+        # (can't receive metrics_store directly because it contains SSL context that can't be pickled)
+        cfg = self._load_local_config(msg.config)
+        self.metrics_store = metrics.metrics_store(
+            cfg=cfg,
+            workload=msg.workload_name,
+            test_procedure=msg.test_procedure_name,
+            read_only=False
+        )
 
         # Create postprocessors (reuse existing classes)
         self.sample_postprocessor = DefaultSamplePostprocessor(
-            msg.metrics_store,
+            self.metrics_store,
             msg.downsample_factor,
             msg.workload_meta_data,
             msg.test_procedure_meta_data
         )
         self.profile_postprocessor = ProfileMetricsSamplePostprocessor(
-            msg.metrics_store,
+            self.metrics_store,
             msg.workload_meta_data,
             msg.test_procedure_meta_data
         )
