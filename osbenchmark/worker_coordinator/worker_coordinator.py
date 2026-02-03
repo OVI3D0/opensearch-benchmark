@@ -1615,7 +1615,11 @@ class Worker(actor.BenchmarkActor):
             else:
                 self.logger.info("Worker[%d] is executing tasks at index [%d] for client [%d].",
                                 self.worker_id, self.current_task_index, task_allocations[0].client_id)
-                self.sampler = DefaultSampler(start_timestamp=time.perf_counter(), buffer_size=self.sample_queue_size)
+                start_timestamp = time.perf_counter()
+                self.sampler = DefaultSampler(start_timestamp=start_timestamp, buffer_size=self.sample_queue_size)
+                # Initialize profile_sampler even though SyncExecutor doesn't use it
+                # (needed by send_samples which sends to MetricsActor)
+                self.profile_sampler = ProfileMetricsSampler(start_timestamp=start_timestamp, buffer_size=self.sample_queue_size)
 
                 executor = SyncIoAdapter(
                     self.config, self.workload, task_allocations[0],
@@ -2177,30 +2181,71 @@ async def execute_single(runner, opensearch, params, on_error, redline_enabled=F
 
 def execute_single_sync(runner, opensearch, params, on_error, redline_enabled=False, client_enabled=True):
     """
-    Synchronous version of execute_single. Invokes the given runner once.
+    Synchronous version of execute_single. Calls the sync OpenSearch client directly.
+
+    This bypasses the async runner infrastructure and makes direct synchronous HTTP
+    calls using urllib3, providing true parallelism when run in separate processes.
 
     :return: a triple of: total number of operations, unit of operations, a dict of request meta data (may be None).
     """
     # pylint: disable=import-outside-toplevel
     import opensearchpy
+    logger = logging.getLogger(__name__)
     fatal_error = False
+
     if client_enabled:
         try:
-            with runner:
-                return_value = runner(opensearch, params)
-            if isinstance(return_value, tuple) and len(return_value) == 2:
-                total_ops, total_ops_unit = return_value
-                request_meta_data = {"success": True}
-            elif isinstance(return_value, dict):
-                total_ops = return_value.pop("weight", 1)
-                total_ops_unit = return_value.pop("unit", "ops")
-                request_meta_data = return_value
-                if "success" not in request_meta_data:
-                    request_meta_data["success"] = True
+            # Get the cluster name (default to "default")
+            cluster = params.get("cluster", "default")
+            os_client = opensearch.get(cluster) or opensearch.get("default")
+
+            # Extract operation parameters
+            index = params.get("index")
+            body = params.get("body")
+            request_timeout = params.get("request-timeout")
+            cache = params.get("cache")
+
+            # Build request params
+            request_params = {}
+            if request_timeout is not None:
+                request_params["request_timeout"] = request_timeout
+            if cache is not None:
+                request_params["request_cache"] = str(cache).lower()
+
+            # Execute the search synchronously using urllib3-based sync client
+            # This is a blocking call at the OS level (not Python event loop)
+            response = os_client.search(
+                index=index,
+                body=body,
+                **request_params
+            )
+
+            # Parse response (same as Query runner)
+            hits = response.get("hits", {})
+            total_hits = hits.get("total", {})
+            if isinstance(total_hits, dict):
+                hits_total = total_hits.get("value", 0)
+                hits_relation = total_hits.get("relation", "eq")
             else:
-                total_ops = 1
-                total_ops_unit = "ops"
-                request_meta_data = {"success": True}
+                hits_total = total_hits
+                hits_relation = "eq"
+
+            request_meta_data = {
+                "success": True,
+                "hits": hits_total,
+                "hits_relation": hits_relation,
+                "timed_out": response.get("timed_out", False),
+                "took": response.get("took"),
+            }
+
+            # Include hit IDs for recall calculation if needed
+            hit_ids = [hit.get("_id") for hit in hits.get("hits", [])]
+            if hit_ids:
+                request_meta_data["hits_ids"] = hit_ids
+
+            total_ops = 1
+            total_ops_unit = "ops"
+
         except opensearchpy.TransportError as e:
             request_context_holder.on_client_request_end()
             if type(e) is opensearchpy.ConnectionError:
