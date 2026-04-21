@@ -84,6 +84,12 @@ def _ensure_builtin_engines():
             register_engine("vespa", vespa_engine)
         except ImportError as e:
             logger.debug("Vespa engine not available: %s", e)
+    if "milvus" not in _ENGINE_REGISTRY:
+        try:
+            from osbenchmark.engine import milvus as milvus_engine  # pylint: disable=import-outside-toplevel
+            register_engine("milvus", milvus_engine)
+        except ImportError as e:
+            logger.debug("Milvus engine not available: %s", e)
 
 
 def get_engine(name):
