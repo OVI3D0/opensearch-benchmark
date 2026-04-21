@@ -35,9 +35,9 @@ runner classes without changes:
 
     from osbenchmark.worker_coordinator.runner import PutSettings, Retry, Runner
 
-New database backends (Vespa, Milvus, ...) live under
-osbenchmark/worker_coordinator/runners/ as a separate subpackage and import
-their base classes from this module.
+New engine backends (Vespa, Milvus, ...) live under osbenchmark/engine/<name>/
+as self-contained modules. Their runners import Runner and request_context_holder
+from this module (osbenchmark.worker_coordinator.runner).
 """
 
 import asyncio
@@ -1339,6 +1339,8 @@ def parse(text: BytesIO, props: List[str], lists: List[str] = None) -> dict:
     return parsed
 
 
+
+
 class Query(Runner):
     """
     Runs a request body search against OpenSearch.
@@ -1599,7 +1601,6 @@ class Query(Runner):
             Perform vector search and report recall@k , recall@r and time taken to perform recall in ms as
             meta object.
             """
-
             def _is_empty_search_results(content):
                 if content is None:
                     return True
@@ -1771,6 +1772,7 @@ class Query(Runner):
                     "timed_out": timed_out,
                     "took": took
                 })
+
 
             recall_processing_start = time.perf_counter()
             response_json = json.loads(response.getvalue())

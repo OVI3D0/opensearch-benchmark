@@ -43,7 +43,7 @@ from osbenchmark.synthetic_data_generator import synthetic_data_generator_orches
 from osbenchmark.workload_generator import workload_generator
 from osbenchmark.utils import io, convert, process, console, net, opts, versions
 from osbenchmark import aggregator
-from osbenchmark.database.registry import DatabaseType
+from osbenchmark.engine import available_engines
 
 def create_arg_parser():
     def positive_number(v):
@@ -601,11 +601,10 @@ def create_arg_parser():
         default=opts.ClientOptions.DEFAULT_CLIENT_OPTIONS)
     test_run_parser.add_argument(
         "--database-type",
-        help="Target database backend. Selects the DatabaseClient adapter used to run "
-             "the workload (default: opensearch). Choices are populated from the "
-             "registered DatabaseType enum.",
-        choices=[d.value for d in DatabaseType],
-        default=DatabaseType.OPENSEARCH.value)
+        help="Target database backend. Selects the engine module used to run the workload "
+             "(default: opensearch). Choices are populated from the registered engines.",
+        choices=available_engines(),
+        default="opensearch")
     test_run_parser.add_argument("--on-error",
                              choices=["continue", "abort"],
                              help="Controls how OSB behaves on response errors (default: continue).",
@@ -1089,7 +1088,7 @@ def configure_connection_params(arg_parser, args, cfg):
     cfg.add(config.Scope.applicationOverride, "client", "grpc_hosts", grpc_target_hosts)
 
     # Configure database backend; worker_coordinator reads cfg.opts("database", "type")
-    # to pick the DatabaseClient factory via the database/ registry.
+    # to pick the engine module via osbenchmark.engine.get_engine().
     database_type = getattr(args, "database_type", "opensearch")
     cfg.add(config.Scope.applicationOverride, "database", "type", database_type)
     if "timeout" not in client_options.default:
