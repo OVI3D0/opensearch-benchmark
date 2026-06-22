@@ -1741,6 +1741,10 @@ class Worker(actor.BenchmarkActor):
             # pylint: disable=import-outside-toplevel
             from osbenchmark.database.clients.vespa import register_vespa_runners
             register_vespa_runners()
+        elif database_type.lower() == "milvus":
+            # pylint: disable=import-outside-toplevel
+            from osbenchmark.database.clients.milvus import register_milvus_runners
+            register_milvus_runners()
         if self.workload.has_plugins:
             workload.load_workload_plugins(self.config, self.workload.name, runner.register_runner, scheduler.register_scheduler)
         self.drive()

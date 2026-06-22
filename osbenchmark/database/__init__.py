@@ -58,9 +58,11 @@ from osbenchmark.database.registry import register_database, DatabaseType
 from osbenchmark.database.factory import DatabaseClientFactory
 from osbenchmark.database.clients.opensearch.opensearch import OpenSearchClientFactory
 from osbenchmark.database.clients.vespa import VespaClientFactory
+from osbenchmark.database.clients.milvus import MilvusClientFactory
 
 register_database(DatabaseType.OPENSEARCH, OpenSearchClientFactory)
 register_database(DatabaseType.VESPA, VespaClientFactory)
+register_database(DatabaseType.MILVUS, MilvusClientFactory)
 
 # Public API exports
 __all__ = [
