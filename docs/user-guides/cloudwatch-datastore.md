@@ -7,7 +7,7 @@ nav_order: 30
 
 # CloudWatch reporting datastore
 
-OpenSearch Benchmark can ship benchmark metrics, telemetry, and test-run
+OpenSearch Benchmark can ship benchmark metrics, telemetry, and test-execution
 documents to **Amazon CloudWatch** as an alternative to the existing
 OpenSearch reporting datastore. Configuration is the same `benchmark.ini`
 flow you already use — change `datastore.type = opensearch` to
@@ -39,7 +39,7 @@ Logs, which auto-extracts the numeric values as CloudWatch Metrics.
 3. Run a benchmark as usual:
 
    ```bash
-   opensearch-benchmark run --workload=geonames --target-hosts=...
+   opensearch-benchmark execute-test --workload=geonames --target-hosts=...
    ```
 
 At the start of the run you'll see a line like:
@@ -68,7 +68,7 @@ All keys live in the `[reporting]` section of `benchmark.ini`.
 | `datastore.region` | (from boto3 chain) | AWS region. Optional — boto3 also reads `AWS_REGION`, `AWS_DEFAULT_REGION`, or the active profile's region. |
 | `datastore.namespace` | `OSB` | CloudWatch Metrics namespace. |
 | `datastore.log_group.metrics` | `benchmark-metrics` | Per-sample EMF log group. |
-| `datastore.log_group.test_runs` | `benchmark-test-runs` | Test-run document log group. |
+| `datastore.log_group.test_executions` | `benchmark-test-runs` | Test-execution document log group. The pre-3.x key `datastore.log_group.test_runs` is still read as a fallback, and the default group name remains `benchmark-test-runs` for back-compat with existing data. |
 | `datastore.log_group.results` | `benchmark-results` | Aggregated results log group. |
 | `datastore.log_retention_days` | (none — never expires) | CloudWatch Logs retention. Must be one of CW's accepted values (1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653). |
 | `datastore.profile` | (none) | Named AWS profile (`~/.aws/credentials` or `~/.aws/config`). |
@@ -100,7 +100,8 @@ Minimum policy for write-only operation:
 ```
 
 Add these permissions if the same role also runs `osbenchmark compare`,
-`osbenchmark list test-runs`, or `osbenchmark aggregate`:
+`osbenchmark list test-executions` (the deprecated `osbenchmark list test-runs`
+still works), or `osbenchmark aggregate`:
 
 ```json
 {
@@ -127,7 +128,9 @@ deliberately kept small (`Workload`, `Task`, `OperationType`,
 `SampleType`) to keep CloudWatch's custom-metric count — and your bill —
 bounded. Run-identity fields (`TestRunId`, `NodeName`, user tags) are
 emitted as plain top-level log fields so they're queryable via Logs
-Insights but do not multiply the custom-metric count.
+Insights but do not multiply the custom-metric count. (The read/query
+path also accepts the newer `TestExecutionId` field name, so historical
+and future events both resolve.)
 
 **Telemetry payloads** (NodeStats, ShardStats, etc.) take a slightly
 different path: each device emits a flattened dict with many numeric
@@ -135,11 +138,11 @@ fields, which OSB groups by prefix (`indices_*`, `jvm_*`, `os_*`, ...)
 into multiple `CloudWatchMetrics` directives within a single EMF event
 so each directive stays under EMF's 100-metric-per-directive cap.
 
-**Test-run and results documents** are written as plain JSON log events
+**Test-execution and results documents** are written as plain JSON log events
 (no EMF metric extraction) to dedicated log groups, mirroring the way
 the OpenSearch backend writes whole documents to dedicated indices.
 
-**Reads** (the `osbenchmark compare`, `aggregate`, `list test-runs`
+**Reads** (the `osbenchmark compare`, `aggregate`, `list test-executions`
 paths) are backed by CloudWatch Logs Insights queries. Note that
 Insights queries take a few seconds even for small result sets — slower
 than the OpenSearch backend's sub-second aggregations.
