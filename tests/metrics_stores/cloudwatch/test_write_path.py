@@ -48,8 +48,8 @@ from osbenchmark.metrics_stores.cloudwatch.metrics_store import (
 from osbenchmark.metrics_stores.cloudwatch.results_store import (
     CloudWatchResultsStore,
 )
-from osbenchmark.metrics_stores.cloudwatch.test_run_store import (
-    CloudWatchTestRunStore,
+from osbenchmark.metrics_stores.cloudwatch.test_execution_store import (
+    CloudWatchTestExecutionStore,
 )
 
 from .conftest import _ResourceNotFound, make_client_error
@@ -74,9 +74,26 @@ class TestConfigLoad:
         assert c.region is None  # optional; boto3 resolves from chain
         assert c.namespace == "OSB"
         assert c.metrics_log_group == "benchmark-metrics"
-        assert c.test_runs_log_group == "benchmark-test-runs"
+        assert c.test_executions_log_group == "benchmark-test-runs"
         assert c.results_log_group == "benchmark-results"
         assert c.log_retention_days is None
+
+    def test_new_log_group_key_preferred(self):
+        # read-both: the 3.x key datastore.log_group.test_executions wins.
+        cfg = _Cfg({
+            ("reporting", "datastore.log_group.test_executions"): "cfg-new-group",
+            ("reporting", "datastore.log_group.test_runs"): "cfg-old-group",
+        })
+        c = cw_config_mod.load(cfg)
+        assert c.test_executions_log_group == "cfg-new-group"
+
+    def test_legacy_log_group_key_still_read(self):
+        # read-both: with only the pre-3.x key set, it is honoured for back-compat.
+        cfg = _Cfg({
+            ("reporting", "datastore.log_group.test_runs"): "cfg-old-group",
+        })
+        c = cw_config_mod.load(cfg)
+        assert c.test_executions_log_group == "cfg-old-group"
 
     def test_explicit_overrides(self):
         cfg = _Cfg({
@@ -109,6 +126,9 @@ class TestConfigLoad:
 
 class TestEmfBuildEvent:
     def _doc(self, **overrides):
+        # NOTE: pre-3.x input keys (test-run-id / test-run-timestamp) on purpose —
+        # this fixture proves build_event still reads the LEGACY in-process doc keys.
+        # A new-format counterpart lives in test_run_identity_read_both below.
         doc = {
             "@timestamp": 1709654400000,
             "test-run-id": "abc-123",
@@ -138,8 +158,10 @@ class TestEmfBuildEvent:
         assert evt["Task"] == "term"
         assert evt["OperationType"] == "search"
         assert evt["SampleType"] == "normal"
-        # Run-identity fields land at top level (queryable, not dimensions)
-        assert evt["TestRunId"] == "abc-123"
+        # Run-identity fields land at top level (queryable, not dimensions).
+        # WRITE-assert: production emits the reverted 3.x TestExecutionId even
+        # though this fixture fed the legacy test-run-id input key (read-both).
+        assert evt["TestExecutionId"] == "abc-123"
         assert evt["Environment"] == "default"
         assert evt["Operation"] == "term"
         assert evt["Unit"] == "ms"
@@ -159,6 +181,21 @@ class TestEmfBuildEvent:
         assert directive["Metrics"] == [
             {"Name": "service_time", "Unit": "Milliseconds", "StorageResolution": 1}
         ]
+
+    def test_run_identity_read_both(self):
+        # read-both: build_event must accept the 3.x input keys
+        # (test-execution-id / test-execution-timestamp) just like the legacy
+        # ones exercised by _doc(). Production emits the reverted TestExecutionId.
+        doc = {
+            "@timestamp": 1709654400000,
+            "test-execution-id": "exec-999",
+            "test-execution-timestamp": "20260622T120000Z",
+            "name": "service_time",
+            "value": 12.3,
+            "unit": "ms",
+        }
+        evt = emf.build_event(doc, namespace="OSB")
+        assert evt["TestExecutionId"] == "exec-999"
 
     def test_no_dimensions_uses_inner_empty(self):
         # EMF schema needs `Dimensions: [[]]` for the no-dim case, NOT
@@ -429,7 +466,7 @@ class _MetricsCfg:
         self._o = {
             ("system", "env.name"): "default",
             ("workload", "params"): {},
-            ("test_run", "user.tag"): "",
+            ("test_execution", "user.tag"): "",
         }
 
     def opts(self, section, key, default_value=None, mandatory=True):
@@ -460,8 +497,8 @@ class TestCloudWatchMetricsStoreWrite:
             config_loader=lambda cfg: cw_config,
         )
         store.open(
-            test_run_id="abc-123",
-            test_run_timestamp=datetime.datetime(2026, 6, 22, 12, 0, 0),
+            test_execution_id="abc-123",
+            test_execution_timestamp=datetime.datetime(2026, 6, 22, 12, 0, 0),
             workload_name="big5",
             test_procedure_name="p",
             cluster_config_name="c",
@@ -538,44 +575,46 @@ class TestCloudWatchMetricsStoreWrite:
 
 
 class _StoreCfg:
-    """Config double for the test-run/results store constructors."""
+    """Config double for the test-execution/results store constructors."""
     def __init__(self):
         self._o = {
             ("system", "env.name"): "default",
-            ("system", "list.test_runs.max_results"): 20,
+            ("system", "list.test_executions.max_results"): 20,
         }
 
     def opts(self, section, key, default_value=None, mandatory=True):
         return self._o.get((section, key), default_value)
 
 
-class _FakeTestRun:
-    test_run_id = "abc-123"
+class _FakeTestExecution:
+    # WRITE-assert fixture: production TestExecution.as_dict now emits the
+    # reverted 3.x key test-execution-id.
+    test_execution_id = "abc-123"
 
     def as_dict(self):
-        return {"test-run-id": "abc-123", "workload": "big5", "duration": 10.5}
+        return {"test-execution-id": "abc-123", "workload": "big5", "duration": 10.5}
 
     def to_result_dicts(self):
         return [
-            {"test-run-id": "abc-123", "metric": "latency.mean", "value": 12.3},
-            {"test-run-id": "abc-123", "metric": "throughput.mean", "value": 1000.0},
+            {"test-execution-id": "abc-123", "metric": "latency.mean", "value": 12.3},
+            {"test-execution-id": "abc-123", "metric": "throughput.mean", "value": 1000.0},
         ]
 
 
-class TestCloudWatchTestRunStoreWrite:
-    def test_store_test_run_emits_one_event(self, fake_logs_client, cw_config):
-        store = CloudWatchTestRunStore(
+class TestCloudWatchTestExecutionStoreWrite:
+    def test_store_test_execution_emits_one_event(self, fake_logs_client, cw_config):
+        store = CloudWatchTestExecutionStore(
             cfg=_StoreCfg(),
             client_factory_class=_make_fake_factory(fake_logs_client),
             config_loader=lambda cfg: cw_config,
         )
-        store.store_test_run(_FakeTestRun())
+        store.store_test_execution(_FakeTestExecution())
         assert len(fake_logs_client.put_calls) == 1
         call = fake_logs_client.put_calls[0]
-        assert call["logGroupName"] == cw_config.test_runs_log_group
+        assert call["logGroupName"] == cw_config.test_executions_log_group
         assert len(call["logEvents"]) == 1
         parsed = json.loads(call["logEvents"][0]["message"])
-        assert parsed["test-run-id"] == "abc-123"
+        assert parsed["test-execution-id"] == "abc-123"
 
 
 class TestCloudWatchResultsStoreWrite:
@@ -585,7 +624,7 @@ class TestCloudWatchResultsStoreWrite:
             client_factory_class=_make_fake_factory(fake_logs_client),
             config_loader=lambda cfg: cw_config,
         )
-        store.store_results(_FakeTestRun())
+        store.store_results(_FakeTestExecution())
         assert len(fake_logs_client.put_calls) == 1
         events = fake_logs_client.put_calls[0]["logEvents"]
         assert len(events) == 2  # one per result dict
@@ -594,7 +633,7 @@ class TestCloudWatchResultsStoreWrite:
 
     def test_empty_results_does_not_provision(self, fake_logs_client, cw_config):
         class _Empty:
-            test_run_id = "x"
+            test_execution_id = "x"
 
             def to_result_dicts(self):
                 return []

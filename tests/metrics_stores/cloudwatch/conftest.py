@@ -145,7 +145,7 @@ def cw_config():
         region="us-east-1",
         namespace="OSB",
         metrics_log_group="benchmark-metrics",
-        test_runs_log_group="benchmark-test-runs",
+        test_executions_log_group="benchmark-test-runs",
         results_log_group="benchmark-results",
         log_retention_days=None,
         profile=None,

@@ -10,7 +10,7 @@ def mock_config():
     return mock_cfg
 
 @pytest.fixture
-def mock_test_runs():
+def mock_test_executions():
     return {
         "test1": Mock(),
         "test2": Mock()
@@ -18,6 +18,9 @@ def mock_test_runs():
 
 @pytest.fixture
 def mock_args():
+    # test_run_id (legacy CLI dest) on purpose: the aggregator reads
+    # test_execution_id first and falls back to test_run_id, so this keeps the
+    # deprecated-alias path covered.
     return Mock(
         results_file="",
         test_run_id="",
@@ -27,15 +30,15 @@ def mock_args():
 @pytest.fixture
 def mock_test_store():
     mock_store = Mock()
-    mock_store.find_by_test_run_id.side_effect = [
+    mock_store.find_by_test_execution_id.side_effect = [
         Mock(results={"key1": {"nested": 10}}, workload="workload1", test_procedure="test_proc1"),
         Mock(results={"key1": {"nested": 20}}, workload="workload1", test_procedure="test_proc1")
     ]
     return mock_store
 
 @pytest.fixture
-def aggregator(mock_config, mock_test_runs, mock_args, mock_test_store):
-    aggregator = Aggregator(mock_config, mock_test_runs, mock_args)
+def aggregator(mock_config, mock_test_executions, mock_args, mock_test_store):
+    aggregator = Aggregator(mock_config, mock_test_executions, mock_args)
     aggregator.test_store = mock_test_store
     return aggregator
 
@@ -51,12 +54,12 @@ def test_count_iterations_for_each_op(aggregator):
     mock_workload.test_procedures = [mock_test_procedure]
 
     mock_workload.find_test_procedure_or_default = Mock(return_value=mock_test_procedure)
-    mock_test_run = Mock(test_run_id="test1", workload_params={})
+    mock_test_execution = Mock(test_execution_id="test1", workload_params={})
 
     aggregator.loaded_workload = mock_workload
     aggregator.test_procedure_name = "test_procedure_name"
 
-    aggregator.count_iterations_for_each_op(mock_test_run)
+    aggregator.count_iterations_for_each_op(mock_test_execution)
 
     assert "test1" in aggregator.accumulated_iterations, "test1 not found in accumulated_iterations"
     assert "op1" in aggregator.accumulated_iterations["test1"], "op1 not found in accumulated_iterations for test1"
@@ -84,17 +87,17 @@ def test_accumulate_results(aggregator):
     assert "task1" in aggregator.accumulated_results
     assert all(metric in aggregator.accumulated_results["task1"] for metric in aggregator.metrics)
 
-def test_test_run_compatibility_check(aggregator):
+def test_test_execution_compatibility_check(aggregator):
     mock_test_store = Mock()
-    mock_test_store.find_by_test_run_id.side_effect = [
+    mock_test_store.find_by_test_execution_id.side_effect = [
         Mock(workload="workload1", test_procedure="test_proc1"),
         Mock(workload="workload1", test_procedure="test_proc1"),
         Mock(workload="workload1", test_procedure="test_proc1"),  # Add one more mock response
     ]
     aggregator.test_store = mock_test_store
-    aggregator.test_runs = {"test1": Mock(), "test2": Mock()}
+    aggregator.test_executions = {"test1": Mock(), "test2": Mock()}
 
-    assert aggregator.test_run_compatibility_check()
+    assert aggregator.test_execution_compatibility_check()
 
 def test_aggregate_json_by_key(aggregator):
     result = aggregator.aggregate_json_by_key("key1.nested")
@@ -112,7 +115,7 @@ def test_calculate_weighted_average(aggregator):
         "test1": {"op1": 2},
         "test2": {"op1": 3}
     }
-    aggregator.test_runs = {"test1": Mock(), "test2": Mock()}
+    aggregator.test_executions = {"test1": Mock(), "test2": Mock()}
 
     result = aggregator.calculate_weighted_average(task_metrics, task_name)
 
@@ -125,16 +128,16 @@ def test_calculate_rsd(aggregator):
     rsd = aggregator.calculate_rsd(values, "test_metric")
     assert isinstance(rsd, float)
 
-def test_test_run_compatibility_check_incompatible(aggregator):
+def test_test_execution_compatibility_check_incompatible(aggregator):
     mock_test_store = Mock()
-    mock_test_store.find_by_test_run_id.side_effect = [
+    mock_test_store.find_by_test_execution_id.side_effect = [
         Mock(workload="workload1", test_procedure="test_proc1"),
         Mock(workload="workload2", test_procedure="test_proc1"),
     ]
     aggregator.test_store = mock_test_store
-    aggregator.test_runs = {"test1": Mock(), "test2": Mock()}
+    aggregator.test_executions = {"test1": Mock(), "test2": Mock()}
     with pytest.raises(ValueError):
-        aggregator.test_run_compatibility_check()
+        aggregator.test_execution_compatibility_check()
 
 def test_aggregated_results():
     results = {"key": "value"}

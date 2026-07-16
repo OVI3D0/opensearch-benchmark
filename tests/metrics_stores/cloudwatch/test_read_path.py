@@ -24,8 +24,8 @@
 
 """
 Unit tests for the CloudWatch datastore read path: the Insights helper,
-MetricsStore read methods, and CloudWatchTestRunStore listing/lookup
-plus the FileBackedCompositeTestRunStore fallback semantics.
+MetricsStore read methods, and CloudWatchTestExecutionStore listing/lookup
+plus the FileBackedCompositeTestExecutionStore fallback semantics.
 """
 import datetime
 import json
@@ -44,9 +44,9 @@ from osbenchmark.metrics_stores.cloudwatch.insights import (
 from osbenchmark.metrics_stores.cloudwatch.metrics_store import (
     CloudWatchMetricsStore,
 )
-from osbenchmark.metrics_stores.cloudwatch.test_run_store import (
-    CloudWatchTestRunStore,
-    FileBackedCompositeTestRunStore,
+from osbenchmark.metrics_stores.cloudwatch.test_execution_store import (
+    CloudWatchTestExecutionStore,
+    FileBackedCompositeTestExecutionStore,
 )
 
 from .conftest import make_client_error, make_insights_rows
@@ -167,7 +167,7 @@ class _MetricsCfg:
     def __init__(self):
         self._o = {("system", "env.name"): "default",
                    ("workload", "params"): {},
-                   ("test_run", "user.tag"): ""}
+                   ("test_execution", "user.tag"): ""}
     def opts(self, section, key, default_value=None, mandatory=True):
         return self._o.get((section, key), default_value)
 
@@ -195,8 +195,8 @@ def open_store(fake_logs_client, cw_config):
             config_loader=lambda cfg: cw_config,
         )
         store.open(
-            test_run_id="abc-123",
-            test_run_timestamp=datetime.datetime(2026, 6, 22, 12, 0, 0),
+            test_execution_id="abc-123",
+            test_execution_timestamp=datetime.datetime(2026, 6, 22, 12, 0, 0),
             workload_name="big5",
             test_procedure_name="p",
             cluster_config_name="c",
@@ -332,12 +332,14 @@ class TestMetricsStoreReads:
         values = store.get("service_time", task="term")
         assert values == [12.3, 15.6]
 
-    def test_all_queries_filter_by_test_run_id(self, fake_logs_client, open_store):
+    def test_all_queries_filter_by_test_execution_id(self, fake_logs_client, open_store):
         fake_logs_client.queue_query_results([])
         store = open_store()
         store.get_stats("x")
         q = fake_logs_client.start_query_calls[-1]["queryString"]
-        assert 'TestRunId = "abc-123"' in q
+        # read-both: the scoping filter ORs the pre-3.x TestRunId and the 3.x
+        # TestExecutionId so historical CW data stays queryable.
+        assert '(TestRunId = "abc-123" or TestExecutionId = "abc-123")' in q
 
     def test_sample_type_enum_lowercased(self, fake_logs_client, open_store):
         fake_logs_client.queue_query_results([])
@@ -364,7 +366,7 @@ class TestMetricsStoreReads:
         # Real-world E2E: IAM role has logs:PutLogEvents but not
         # logs:StartQuery. Reads should fail-soft to empty results so
         # the result-summary path doesn't crash the run. (Same fail-soft
-        # contract as FileBackedCompositeTestRunStore.list.)
+        # contract as FileBackedCompositeTestExecutionStore.list.)
         def boom(**kw):
             raise make_client_error("AccessDeniedException", op="StartQuery")
         fake_logs_client.start_query = boom
@@ -388,17 +390,19 @@ class TestMetricsStoreReads:
         assert "`" not in task_part[task_part.index('"') + 1:task_part.rindex('"')]
 
 
-# ------------------------------------------------------ CloudWatchTestRunStore reads
+# ------------------------------------------------------ CloudWatchTestExecutionStore reads
 
 
 class _StoreCfg:
     def __init__(self):
         self._o = {("system", "env.name"): "default",
-                   ("system", "list.test_runs.max_results"): 20}
+                   ("system", "list.test_executions.max_results"): 20}
     def opts(self, section, key, default_value=None, mandatory=True):
         return self._o.get((section, key), default_value)
 
 
+# read-both: LEGACY-format stored doc (pre-3.x test-run-id / test-run-timestamp).
+# Kept on purpose to prove TestExecution.from_dict still parses old CW data.
 _VALID_TEST_DOC = {
     "benchmark-version": "2.3.0",
     "test-run-id": "run-abc",
@@ -409,10 +413,21 @@ _VALID_TEST_DOC = {
     "cluster-config-instance": "c",
 }
 
+# read-both: NEW-format stored doc (3.x test-execution-id / test-execution-timestamp).
+_VALID_TEST_DOC_NEW = {
+    "benchmark-version": "3.0.0",
+    "test-execution-id": "exec-xyz",
+    "test-execution-timestamp": "20260622T120000Z",
+    "environment": "default",
+    "pipeline": "benchmark-only",
+    "workload": "geonames",
+    "cluster-config-instance": "c",
+}
 
-class TestCloudWatchTestRunStoreReads:
+
+class TestCloudWatchTestExecutionStoreReads:
     def _store(self, fake_logs_client, cw_config):
-        return CloudWatchTestRunStore(
+        return CloudWatchTestExecutionStore(
             cfg=_StoreCfg(),
             client_factory_class=_make_factory(fake_logs_client),
             config_loader=lambda cfg: cw_config,
@@ -425,10 +440,20 @@ class TestCloudWatchTestRunStoreReads:
         store = self._store(fake_logs_client, cw_config)
         runs = store.list()
         assert len(runs) == 1
-        assert runs[0].test_run_id == "run-abc"
+        assert runs[0].test_execution_id == "run-abc"
         q = fake_logs_client.start_query_calls[-1]["queryString"]
         assert 'environment = "default"' in q
         assert "limit 20" in q
+
+    def test_list_parses_new_format_doc(self, fake_logs_client, cw_config):
+        # read-both: a doc stored with the 3.x test-execution-id key parses too.
+        fake_logs_client.queue_query_results([
+            [{"field": "@message", "value": json.dumps(_VALID_TEST_DOC_NEW)}]
+        ])
+        store = self._store(fake_logs_client, cw_config)
+        runs = store.list()
+        assert len(runs) == 1
+        assert runs[0].test_execution_id == "exec-xyz"
 
     def test_list_empty(self, fake_logs_client, cw_config):
         fake_logs_client.queue_query_results([])
@@ -445,27 +470,37 @@ class TestCloudWatchTestRunStoreReads:
         runs = store.list()
         assert len(runs) == 1
 
-    def test_find_by_test_run_id_roundtrips(self, fake_logs_client, cw_config):
+    def test_find_by_test_execution_id_roundtrips(self, fake_logs_client, cw_config):
         fake_logs_client.queue_query_results([
             [{"field": "@message", "value": json.dumps(_VALID_TEST_DOC)}]
         ])
         store = self._store(fake_logs_client, cw_config)
-        run = store.find_by_test_run_id("run-abc")
-        assert run.test_run_id == "run-abc"
+        run = store.find_by_test_execution_id("run-abc")
+        assert run.test_execution_id == "run-abc"
         q = fake_logs_client.start_query_calls[-1]["queryString"]
-        assert '`test-run-id` = "run-abc"' in q
+        # read-both: the raw-field filter ORs the pre-3.x and 3.x dashed keys.
+        assert '`test-run-id` = "run-abc" or `test-execution-id` = "run-abc"' in q
 
-    def test_find_by_test_run_id_miss_raises_with_os_wording(
+    def test_find_by_test_execution_id_new_format_roundtrips(self, fake_logs_client, cw_config):
+        # read-both: lookup resolves a doc stored with the 3.x key.
+        fake_logs_client.queue_query_results([
+            [{"field": "@message", "value": json.dumps(_VALID_TEST_DOC_NEW)}]
+        ])
+        store = self._store(fake_logs_client, cw_config)
+        run = store.find_by_test_execution_id("exec-xyz")
+        assert run.test_execution_id == "exec-xyz"
+
+    def test_find_by_test_execution_id_miss_raises_with_os_wording(
             self, fake_logs_client, cw_config):
         # Empty results in both the 7-day and 90-day window queries.
         fake_logs_client.queue_query_results([])
         store = self._store(fake_logs_client, cw_config)
         with pytest.raises(exceptions.NotFound,
-                           match=r"No test_run with test_run id"):
-            store.find_by_test_run_id("nope")
+                           match=r"No test execution with test execution id"):
+            store.find_by_test_execution_id("nope")
 
 
-# ---------------------------------------------------- FileBackedCompositeTestRunStore
+# ---------------------------------------------------- FileBackedCompositeTestExecutionStore
 
 
 class _FakeFile:
@@ -473,10 +508,10 @@ class _FakeFile:
         self.runs = {}
         self.stored = []
 
-    def store_test_run(self, run):
+    def store_test_execution(self, run):
         self.stored.append(run)
 
-    def find_by_test_run_id(self, tid):
+    def find_by_test_execution_id(self, tid):
         if tid in self.runs:
             return self.runs[tid]
         raise exceptions.NotFound("not local")
@@ -495,14 +530,14 @@ class _FakeCW:
         self.find_result = None
         self.find_called = False
 
-    def store_test_run(self, run):
+    def store_test_execution(self, run):
         pass
 
     def list(self):
         self.list_called = True
         return self.list_result
 
-    def find_by_test_run_id(self, tid):
+    def find_by_test_execution_id(self, tid):
         self.find_called = True
         if self.find_result is not None:
             return self.find_result
@@ -510,8 +545,8 @@ class _FakeCW:
 
 
 class _Run:
-    def __init__(self, test_run_id):
-        self.test_run_id = test_run_id
+    def __init__(self, test_execution_id):
+        self.test_execution_id = test_execution_id
 
 
 class TestFileBackedComposite:
@@ -519,23 +554,23 @@ class TestFileBackedComposite:
         f = _FakeFile()
         f.runs["abc"] = _Run("abc")
         cw = _FakeCW()
-        c = FileBackedCompositeTestRunStore(cw, f)
-        result = c.find_by_test_run_id("abc")
-        assert result.test_run_id == "abc"
+        c = FileBackedCompositeTestExecutionStore(cw, f)
+        result = c.find_by_test_execution_id("abc")
+        assert result.test_execution_id == "abc"
         assert not cw.find_called
 
     def test_find_falls_back_to_cw_on_miss(self):
         cw = _FakeCW()
         cw.find_result = _Run("abc")
-        c = FileBackedCompositeTestRunStore(cw, _FakeFile())
-        result = c.find_by_test_run_id("abc")
-        assert result.test_run_id == "abc"
+        c = FileBackedCompositeTestExecutionStore(cw, _FakeFile())
+        result = c.find_by_test_execution_id("abc")
+        assert result.test_execution_id == "abc"
         assert cw.find_called
 
     def test_find_both_miss_raises_notfound(self):
-        c = FileBackedCompositeTestRunStore(_FakeCW(), _FakeFile())
+        c = FileBackedCompositeTestExecutionStore(_FakeCW(), _FakeFile())
         with pytest.raises(exceptions.NotFound):
-            c.find_by_test_run_id("nope")
+            c.find_by_test_execution_id("nope")
 
     def test_list_merges_and_dedupes(self):
         f = _FakeFile()
@@ -543,8 +578,8 @@ class TestFileBackedComposite:
         f.runs["b"] = _Run("b")
         cw = _FakeCW()
         cw.list_result = [_Run("b"), _Run("c")]  # b dup'd, c CW-only
-        c = FileBackedCompositeTestRunStore(cw, f)
-        ids = [r.test_run_id for r in c.list()]
+        c = FileBackedCompositeTestExecutionStore(cw, f)
+        ids = [r.test_execution_id for r in c.list()]
         assert ids == ["a", "b", "c"]
 
     def test_list_degrades_gracefully_on_cw_error(self):
@@ -553,8 +588,8 @@ class TestFileBackedComposite:
                 raise RuntimeError("boom (any exception)")
         f = _FakeFile()
         f.runs["a"] = _Run("a")
-        c = FileBackedCompositeTestRunStore(_FailingCW(), f)
-        ids = [r.test_run_id for r in c.list()]
+        c = FileBackedCompositeTestExecutionStore(_FailingCW(), f)
+        ids = [r.test_execution_id for r in c.list()]
         assert ids == ["a"]  # CW failure didn't break the file-store list
 
     def test_write_fans_out(self):
@@ -566,8 +601,8 @@ class TestFileBackedComposite:
 
         def store(run):
             cw_stored.append(run)
-        cw.store_test_run = store
-        c = FileBackedCompositeTestRunStore(cw, f)
-        c.store_test_run(_Run("x"))
+        cw.store_test_execution = store
+        c = FileBackedCompositeTestExecutionStore(cw, f)
+        c.store_test_execution(_Run("x"))
         assert len(f.stored) == 1
         assert len(cw_stored) == 1
