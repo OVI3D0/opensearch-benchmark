@@ -181,10 +181,13 @@ def build_event(doc: Dict[str, Any], namespace: str) -> Optional[Dict[str, Any]]
     # back-compat: accept both 3.x test-execution-id and pre-3.x test-run-id from the in-process doc.
     test_execution_id = doc.get("test-execution-id") or doc.get("test-run-id")
     if test_execution_id is not None:
-        event["TestRunId"] = test_execution_id
+        # Phase D4: emit the 3.x TestExecutionId. Reads OR both TestRunId and
+        # TestExecutionId (see metrics_store.py), so historical CloudWatch data
+        # written with TestRunId stays queryable.
+        event["TestExecutionId"] = test_execution_id
     test_execution_timestamp = doc.get("test-execution-timestamp") or doc.get("test-run-timestamp")
     if test_execution_timestamp is not None:
-        event["TestRunTimestamp"] = test_execution_timestamp
+        event["TestExecutionTimestamp"] = test_execution_timestamp
     if doc.get("environment") is not None:
         event["Environment"] = doc["environment"]
     if doc.get("test_procedure") is not None:
@@ -373,10 +376,11 @@ def build_telemetry_event(doc: Dict[str, Any], namespace: str) -> List[Dict[str,
     # back-compat: accept both 3.x test-execution-* and pre-3.x test-run-* keys from the in-process doc.
     test_execution_id = doc.get("test-execution-id") or doc.get("test-run-id")
     if test_execution_id is not None:
-        event["TestRunId"] = test_execution_id
+        # Phase D4: emit 3.x TestExecutionId (reads OR both names for old data).
+        event["TestExecutionId"] = test_execution_id
     test_execution_timestamp = doc.get("test-execution-timestamp") or doc.get("test-run-timestamp")
     if test_execution_timestamp is not None:
-        event["TestRunTimestamp"] = test_execution_timestamp
+        event["TestExecutionTimestamp"] = test_execution_timestamp
 
     # Top-level fields (queryable via Logs Insights, not dimensions).
     for source_key, event_key in (
