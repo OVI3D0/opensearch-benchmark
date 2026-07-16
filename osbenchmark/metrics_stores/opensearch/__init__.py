@@ -23,7 +23,7 @@
 # under the License.
 
 """
-OpenSearch-backed metrics store, test-run store, and results store.
+OpenSearch-backed metrics store, test-execution store, and results store.
 
 This subpackage provides the symmetric counterpart to the cloudwatch/
 sibling and re-exports the OpenSearch-backed implementations that
@@ -38,5 +38,5 @@ from osbenchmark.metrics import (  # noqa: F401 — re-export
     OsClientFactory,
     OsMetricsStore,
     OsResultsStore,
-    OsTestRunStore,
+    OsTestExecutionStore,
 )
