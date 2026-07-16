@@ -1895,13 +1895,13 @@ def _cloudwatch_metrics_store_class():
     return CloudWatchMetricsStore
 
 
-def _cloudwatch_test_run_store(cfg):
+def _cloudwatch_test_execution_store(cfg):
     # pylint: disable=import-outside-toplevel
-    from osbenchmark.metrics_stores.cloudwatch.test_run_store import (
-        CloudWatchTestRunStore, FileBackedCompositeTestRunStore,
+    from osbenchmark.metrics_stores.cloudwatch.test_execution_store import (
+        CloudWatchTestExecutionStore, FileBackedCompositeTestExecutionStore,
     )
-    return FileBackedCompositeTestRunStore(
-        CloudWatchTestRunStore(cfg), FileTestRunStore(cfg))
+    return FileBackedCompositeTestExecutionStore(
+        CloudWatchTestExecutionStore(cfg), FileTestExecutionStore(cfg))
 
 
 def _cloudwatch_results_store(cfg):
@@ -1913,9 +1913,9 @@ def _cloudwatch_results_store(cfg):
 register_datastore(
     datastore_type="cloudwatch",
     metrics_store_class=_cloudwatch_metrics_store_class,
-    test_run_store=_cloudwatch_test_run_store,
+    test_run_store=_cloudwatch_test_execution_store,
     results_store=_cloudwatch_results_store,
-    test_run_store_log_message="Creating CloudWatch + file test_run store",
+    test_run_store_log_message="Creating CloudWatch + file test_execution store",
     results_store_log_message="Creating CloudWatch results store",
 )
 

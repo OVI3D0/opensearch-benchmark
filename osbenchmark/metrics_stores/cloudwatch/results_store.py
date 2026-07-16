@@ -52,11 +52,11 @@ logger = logging.getLogger(__name__)
 
 class CloudWatchResultsStore:
     """
-    Results store that writes one JSON log event per (test run, result
+    Results store that writes one JSON log event per (test execution, result
     record) tuple to a CloudWatch Logs group.
 
     OsResultsStore explodes the aggregate results into multiple result
-    documents via ``test_run.to_result_dicts()``; we do the same and ship
+    documents via ``test_execution.to_result_dicts()``; we do the same and ship
     them as a single PutLogEvents batch since the total volume per run is
     small (a few dozen records).
     """
@@ -91,10 +91,10 @@ class CloudWatchResultsStore:
             self._STREAM_NAME)
         return self._writer
 
-    def store_results(self, test_run) -> None:
+    def store_results(self, test_execution) -> None:
         timestamp_ms = int(_time.time() * 1000)
         events = []
-        for record in test_run.to_result_dicts():
+        for record in test_execution.to_result_dicts():
             events.append({
                 "timestamp": timestamp_ms,
                 "message": json.dumps(record, separators=(",", ":")),
@@ -102,14 +102,14 @@ class CloudWatchResultsStore:
         if not events:
             logger.debug(
                 "CloudWatch datastore: no result records to ship for test "
-                "run %s", getattr(test_run, "test_run_id", "<unknown>"))
+                "execution %s", getattr(test_execution, "test_execution_id", "<unknown>"))
             return
         writer = self._ensure_writer()
         writer.write_batch(events)
         logger.info(
-            "CloudWatch datastore: shipped %d result records for test run "
+            "CloudWatch datastore: shipped %d result records for test execution "
             "%s to %s",
             len(events),
-            getattr(test_run, "test_run_id", "<unknown>"),
+            getattr(test_execution, "test_execution_id", "<unknown>"),
             self._cw_config.results_log_group,
         )

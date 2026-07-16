@@ -110,16 +110,16 @@ class CloudWatchMetricsStore(MetricsStore):
         self._buffered_events = []
         self._buffered_bytes = 0
 
-    def open(self, test_run_id=None, test_run_timestamp=None,
+    def open(self, test_execution_id=None, test_execution_timestamp=None,
              workload_name=None, test_procedure_name=None,
              cluster_config_name=None, ctx=None, create=False):
         MetricsStore.open(
-            self, test_run_id, test_run_timestamp,
+            self, test_execution_id, test_execution_timestamp,
             workload_name, test_procedure_name,
             cluster_config_name, ctx, create)
 
         # Only do AWS work when we are actually opening for writes. A
-        # read-only open (e.g. `osbenchmark list test-runs`) shouldn't
+        # read-only open (e.g. `osbenchmark list test-executions`) shouldn't
         # require any CloudWatch permissions or pay for the STS probe.
         if not create:
             return
@@ -154,7 +154,7 @@ class CloudWatchMetricsStore(MetricsStore):
         """
         workload = self._workload or "unknown"
         safe_workload = _VALID_STREAM_CHARS.sub("_", workload)
-        return f"{safe_workload}/{self._test_run_id}/{os.getpid()}"
+        return f"{safe_workload}/{self._test_execution_id}/{os.getpid()}"
 
     # ------------------------------------------------------------------ writes
 
@@ -246,7 +246,7 @@ class CloudWatchMetricsStore(MetricsStore):
 
     # ------------------------------------------------------------------ reads
     # Backed by CloudWatch Logs Insights against the configured metrics
-    # log group. Every query is scoped to the current TestRunId so reads
+    # log group. Every query is scoped to the current TestExecutionId so reads
     # never bleed across runs.
 
     def _read_logs_client(self):
@@ -264,7 +264,7 @@ class CloudWatchMetricsStore(MetricsStore):
     def _insights_window(self):
         """
         Time window used for every Insights query on this store. Spans
-        the test-run timestamp (epoch seconds) up to "now"; broad enough
+        the test-execution timestamp (epoch seconds) up to "now"; broad enough
         that a slow benchmark plus clock skew still falls inside.
 
         ``time.from_is8601`` returns a naive datetime — we explicitly
@@ -273,7 +273,7 @@ class CloudWatchMetricsStore(MetricsStore):
         would otherwise apply the local timezone and skew the window by
         hours on non-UTC hosts.
         """
-        ts = time.from_is8601(self._test_run_timestamp)
+        ts = time.from_is8601(self._test_execution_timestamp)
         ts_utc = ts.replace(tzinfo=_datetime.timezone.utc)
         start = int(ts_utc.timestamp()) - 60  # 60s grace for clock skew
         end = int(_time.time()) + 60
@@ -296,7 +296,7 @@ class CloudWatchMetricsStore(MetricsStore):
         """Build the ``filter`` clause shared by every read-side query."""
         safe_name = self._escape_query_value(name)
         # back-compat: match events written with either 3.x TestExecutionId or pre-3.x TestRunId.
-        parts = [f'(TestRunId = "{self._test_run_id}" or TestExecutionId = "{self._test_run_id}")']
+        parts = [f'(TestRunId = "{self._test_execution_id}" or TestExecutionId = "{self._test_execution_id}")']
         parts.append(f'ispresent(`{safe_name}`)')
         if task is not None:
             parts.append(f'Task = "{self._escape_query_value(task)}"')
@@ -314,11 +314,11 @@ class CloudWatchMetricsStore(MetricsStore):
         Returns ``[]`` if the query fails for any reason (Insights
         timeout, permission denied, log group missing, throttle
         exhaustion). The result-summary path
-        (``test_run_orchestrator.calculate_results``) tolerates empty
+        (``test_execution_orchestrator.calculate_results``) tolerates empty
         results by returning ``None`` / ``0.0`` from the calling
         read methods, so a read-permission gap doesn't crash the
-        benchmark. Reads of the test-run / results stores are
-        already fail-soft via FileBackedCompositeTestRunStore."""
+        benchmark. Reads of the test-execution / results stores are
+        already fail-soft via FileBackedCompositeTestExecutionStore."""
         start, end = self._insights_window()
         try:
             return insights.run_query(

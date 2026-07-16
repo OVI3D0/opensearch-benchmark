@@ -51,7 +51,7 @@ class CloudWatchConfig:
     region: Optional[str]
     namespace: str
     metrics_log_group: str
-    test_runs_log_group: str
+    test_executions_log_group: str
     results_log_group: str
     log_retention_days: Optional[int]
     profile: Optional[str]
@@ -78,10 +78,10 @@ def load(cfg) -> CloudWatchConfig:
     # back-compat: prefer the 3.x key datastore.log_group.test_executions, fall back to the
     # pre-3.x key datastore.log_group.test_runs. Read-side only — the write target is unchanged
     # and the old default group benchmark-test-runs stays readable.
-    test_runs_log_group = _opt_str(
+    test_executions_log_group = _opt_str(
         cfg, "datastore.log_group.test_executions", default=None)
-    if test_runs_log_group is None:
-        test_runs_log_group = _opt_str(
+    if test_executions_log_group is None:
+        test_executions_log_group = _opt_str(
             cfg, "datastore.log_group.test_runs", default="benchmark-test-runs")
     results_log_group = _opt_str(
         cfg, "datastore.log_group.results", default="benchmark-results")
@@ -97,7 +97,7 @@ def load(cfg) -> CloudWatchConfig:
         region=region,
         namespace=namespace,
         metrics_log_group=metrics_log_group,
-        test_runs_log_group=test_runs_log_group,
+        test_executions_log_group=test_executions_log_group,
         results_log_group=results_log_group,
         log_retention_days=log_retention_days,
         profile=profile,
