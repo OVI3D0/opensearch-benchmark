@@ -174,7 +174,8 @@ class CloudWatchTestRunStore(TestRunStore):
             safe_id = _escape(test_run_id)
             query = (
                 f'fields @message\n'
-                f'| filter `test-run-id` = "{safe_id}"\n'
+                # back-compat: match docs written with either 3.x test-execution-id or pre-3.x test-run-id.
+                f'| filter `test-run-id` = "{safe_id}" or `test-execution-id` = "{safe_id}"\n'
                 f'| limit 1'
             )
             rows = insights.run_query(

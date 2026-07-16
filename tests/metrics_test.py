@@ -775,8 +775,12 @@ class OsMetricsTests(TestCase):
                 "bool": {
                     "filter": [
                         {
-                            "term": {
-                                "test-run-id": OsMetricsTests.TEST_RUN_ID
+                            "bool": {
+                                "should": [
+                                    {"term": {"test-execution-id": OsMetricsTests.TEST_RUN_ID}},
+                                    {"term": {"test-run-id": OsMetricsTests.TEST_RUN_ID}}
+                                ],
+                                "minimum_should_match": 1
                             }
                         },
                         {
@@ -825,8 +829,12 @@ class OsMetricsTests(TestCase):
                 "bool": {
                     "filter": [
                         {
-                            "term": {
-                                "test-run-id": OsMetricsTests.TEST_RUN_ID
+                            "bool": {
+                                "should": [
+                                    {"term": {"test-execution-id": OsMetricsTests.TEST_RUN_ID}},
+                                    {"term": {"test-run-id": OsMetricsTests.TEST_RUN_ID}}
+                                ],
+                                "minimum_should_match": 1
                             }
                         },
                         {
@@ -882,8 +890,12 @@ class OsMetricsTests(TestCase):
                 "bool": {
                     "filter": [
                         {
-                            "term": {
-                                "test-run-id": OsMetricsTests.TEST_RUN_ID
+                            "bool": {
+                                "should": [
+                                    {"term": {"test-execution-id": OsMetricsTests.TEST_RUN_ID}},
+                                    {"term": {"test-run-id": OsMetricsTests.TEST_RUN_ID}}
+                                ],
+                                "minimum_should_match": 1
                             }
                         },
                         {
@@ -930,8 +942,12 @@ class OsMetricsTests(TestCase):
                 "bool": {
                     "filter": [
                         {
-                            "term": {
-                                "test-run-id": OsMetricsTests.TEST_RUN_ID
+                            "bool": {
+                                "should": [
+                                    {"term": {"test-execution-id": OsMetricsTests.TEST_RUN_ID}},
+                                    {"term": {"test-run-id": OsMetricsTests.TEST_RUN_ID}}
+                                ],
+                                "minimum_should_match": 1
                             }
                         },
                         {
@@ -984,8 +1000,12 @@ class OsMetricsTests(TestCase):
                 "bool": {
                     "filter": [
                         {
-                            "term": {
-                                "test-run-id": OsMetricsTests.TEST_RUN_ID
+                            "bool": {
+                                "should": [
+                                    {"term": {"test-execution-id": OsMetricsTests.TEST_RUN_ID}},
+                                    {"term": {"test-run-id": OsMetricsTests.TEST_RUN_ID}}
+                                ],
+                                "minimum_should_match": 1
                             }
                         },
                         {
@@ -1043,8 +1063,12 @@ class OsMetricsTests(TestCase):
                 "bool": {
                     "filter": [
                         {
-                            "term": {
-                                "test-run-id": OsMetricsTests.TEST_RUN_ID
+                            "bool": {
+                                "should": [
+                                    {"term": {"test-execution-id": OsMetricsTests.TEST_RUN_ID}},
+                                    {"term": {"test-run-id": OsMetricsTests.TEST_RUN_ID}}
+                                ],
+                                "minimum_should_match": 1
                             }
                         },
                         {
@@ -1180,8 +1204,12 @@ class OsMetricsTests(TestCase):
                 "bool": {
                     "filter": [
                         {
-                            "term": {
-                                "test-run-id": OsMetricsTests.TEST_RUN_ID
+                            "bool": {
+                                "should": [
+                                    {"term": {"test-execution-id": OsMetricsTests.TEST_RUN_ID}},
+                                    {"term": {"test-run-id": OsMetricsTests.TEST_RUN_ID}}
+                                ],
+                                "minimum_should_match": 1
                             }
                         },
                         {

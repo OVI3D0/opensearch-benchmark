@@ -178,10 +178,13 @@ def build_event(doc: Dict[str, Any], namespace: str) -> Optional[Dict[str, Any]]
 
     # Top-level fields (queryable via Logs Insights, NOT dimensions — keeps
     # custom-metric cardinality bounded).
-    if doc.get("test-run-id") is not None:
-        event["TestRunId"] = doc["test-run-id"]
-    if doc.get("test-run-timestamp") is not None:
-        event["TestRunTimestamp"] = doc["test-run-timestamp"]
+    # back-compat: accept both 3.x test-execution-id and pre-3.x test-run-id from the in-process doc.
+    test_execution_id = doc.get("test-execution-id") or doc.get("test-run-id")
+    if test_execution_id is not None:
+        event["TestRunId"] = test_execution_id
+    test_execution_timestamp = doc.get("test-execution-timestamp") or doc.get("test-run-timestamp")
+    if test_execution_timestamp is not None:
+        event["TestRunTimestamp"] = test_execution_timestamp
     if doc.get("environment") is not None:
         event["Environment"] = doc["environment"]
     if doc.get("test_procedure") is not None:
@@ -276,7 +279,9 @@ def _sanitize_metric_name(name: str) -> str:
 # doc for metrics. Anything else that happens to be numeric becomes a metric.
 _TELEMETRY_NON_METRIC_FIELDS = frozenset({
     "@timestamp", "relative-time-ms",
+    # back-compat: skip both pre-3.x test-run-* and 3.x test-execution-* keys as metrics.
     "test-run-id", "test-run-timestamp",
+    "test-execution-id", "test-execution-timestamp",
     "environment", "workload", "test_procedure",
     "cluster-config-instance",
     "name",
@@ -365,10 +370,16 @@ def build_telemetry_event(doc: Dict[str, Any], namespace: str) -> List[Dict[str,
             event[event_key] = value
             dimensions_present.append(event_key)
 
+    # back-compat: accept both 3.x test-execution-* and pre-3.x test-run-* keys from the in-process doc.
+    test_execution_id = doc.get("test-execution-id") or doc.get("test-run-id")
+    if test_execution_id is not None:
+        event["TestRunId"] = test_execution_id
+    test_execution_timestamp = doc.get("test-execution-timestamp") or doc.get("test-run-timestamp")
+    if test_execution_timestamp is not None:
+        event["TestRunTimestamp"] = test_execution_timestamp
+
     # Top-level fields (queryable via Logs Insights, not dimensions).
     for source_key, event_key in (
-        ("test-run-id", "TestRunId"),
-        ("test-run-timestamp", "TestRunTimestamp"),
         ("environment", "Environment"),
         ("test_procedure", "TestProcedure"),
         ("cluster-config-instance", "ClusterConfigInstance"),

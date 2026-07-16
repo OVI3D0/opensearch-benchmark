@@ -475,8 +475,10 @@ class MetricsStore:
         False when it is just opened for reading (as we can assume all necessary indices exist at this point).
         """
         if ctx:
-            self._test_run_id = ctx["test-run-id"]
-            self._test_run_timestamp = ctx["test-run-timestamp"]
+            # back-compat: accept both 3.x test-execution-id and pre-3.x test-run-id.
+            self._test_run_id = ctx["test-execution-id"] if "test-execution-id" in ctx else ctx["test-run-id"]
+            self._test_run_timestamp = ctx["test-execution-timestamp"] if "test-execution-timestamp" in ctx \
+                else ctx["test-run-timestamp"]
             self._workload = ctx["workload"]
             self._test_procedure = ctx["test_procedure"]
             self._cluster_config = ctx["cluster-config-instance"]
@@ -1054,8 +1056,14 @@ class OsMetricsStore(MetricsStore):
             "bool": {
                 "filter": [
                     {
-                        "term": {
-                            "test-run-id": self._test_run_id
+                        # back-compat: match docs written with either 3.x test-execution-id
+                        # or pre-3.x test-run-id (fields cannot be aliased without reindex).
+                        "bool": {
+                            "should": [
+                                {"term": {"test-execution-id": self._test_run_id}},
+                                {"term": {"test-run-id": self._test_run_id}}
+                            ],
+                            "minimum_should_match": 1
                         }
                     },
                     {
@@ -1507,8 +1515,13 @@ class TestRun:
         user_tags = d.get("user-tags", {})
         # TODO: cluster is optional for BWC. This can be removed after some grace period.
         cluster = d.get("cluster", {})
-        return TestRun(d["benchmark-version"], d.get("benchmark-revision"), d["environment"], d["test-run-id"],
-                    time.from_is8601(d["test-run-timestamp"]),
+        # back-compat: accept both 3.x test-execution-id and pre-3.x test-run-id.
+        # Explicit "in" checks (not .get) so a doc missing BOTH keys still raises KeyError.
+        test_execution_id = d["test-execution-id"] if "test-execution-id" in d else d["test-run-id"]
+        test_execution_timestamp = d["test-execution-timestamp"] if "test-execution-timestamp" in d \
+            else d["test-run-timestamp"]
+        return TestRun(d["benchmark-version"], d.get("benchmark-revision"), d["environment"], test_execution_id,
+                    time.from_is8601(test_execution_timestamp),
                     d["pipeline"], user_tags, d["workload"], d.get("workload-params"),
                     d.get("test_procedure"), d["cluster-config-instance"],
                     d.get("cluster-config-instance-params"), d.get("plugin-params"),
@@ -1628,13 +1641,29 @@ class FileTestRunStore(TestRunStore):
         else:
             return os.path.join(paths.test_run_root(cfg=self.cfg, test_run_id=test_run_id), "test_run.json")
 
+    def _test_execution_file(self, test_run_id=None, is_aggregated=False):
+        # back-compat read helper for the 3.x on-disk layout (test-executions/ dir +
+        # test_execution.json / aggregated_test_execution.json). Write-side still uses
+        # _test_run_file; this only widens read globs so both layouts stay listable (Phase 0).
+        root_dir = self.cfg.opts("node", "root.dir")
+        glob_id = test_run_id if test_run_id else "*"
+        if is_aggregated:
+            return os.path.join(root_dir, "aggregated_results", glob_id, "aggregated_test_execution.json")
+        else:
+            return os.path.join(root_dir, "test-executions", glob_id, "test_execution.json")
+
     def list(self):
-        results = glob.glob(self._test_run_file(test_run_id="*"))
+        # back-compat: glob BOTH the pre-3.x (test-runs/*/test_run.json) and 3.x
+        # (test-executions/*/test_execution.json) layouts so historical runs stay listable.
+        results = glob.glob(self._test_run_file(test_run_id="*")) + \
+            glob.glob(self._test_execution_file(test_run_id="*"))
         all_test_runs = self._to_test_runs(results)
         return all_test_runs[:self._max_results()]
 
     def list_aggregations(self):
-        aggregated_results = glob.glob(self._test_run_file(test_run_id="*", is_aggregated=True))
+        # back-compat: glob both pre-3.x aggregated_test_run.json and 3.x aggregated_test_execution.json.
+        aggregated_results = glob.glob(self._test_run_file(test_run_id="*", is_aggregated=True)) + \
+            glob.glob(self._test_execution_file(test_run_id="*", is_aggregated=True))
         return self._to_test_runs(aggregated_results)
 
     def find_by_test_run_id(self, test_run_id):
@@ -1660,7 +1689,15 @@ class FileTestRunStore(TestRunStore):
 
 class OsTestRunStore(TestRunStore):
     INDEX_PREFIX = "benchmark-test-runs-"
+    # back-compat: 3.x wrote indices under this prefix. Reads must span it too.
+    EXECUTION_INDEX_PREFIX = "benchmark-test-executions-"
     TEST_RUN_DOC_TYPE = "_doc"
+
+    @staticmethod
+    def _read_index_pattern():
+        # back-compat: comma-joined pattern so reads span BOTH the pre-3.x
+        # benchmark-test-runs-* and the 3.x benchmark-test-executions-* indices.
+        return "%s*,%s*" % (OsTestRunStore.INDEX_PREFIX, OsTestRunStore.EXECUTION_INDEX_PREFIX)
 
     def __init__(self, cfg, client_factory_class=OsClientFactory, index_template_provider_class=IndexTemplateProvider):
         """
@@ -1703,15 +1740,25 @@ class OsTestRunStore(TestRunStore):
                 }
             },
             "size": self._max_results(),
+            # back-compat: docs may carry only the pre-3.x test-run-timestamp OR only the
+            # 3.x test-execution-timestamp. Sort over both; unmapped_type keeps the query from
+            # failing when one field is entirely absent from the matched indices.
             "sort": [
                 {
+                    "test-execution-timestamp": {
+                        "order": "desc",
+                        "unmapped_type": "date"
+                    }
+                },
+                {
                     "test-run-timestamp": {
-                        "order": "desc"
+                        "order": "desc",
+                        "unmapped_type": "date"
                     }
                 }
             ]
         }
-        result = self.client.search(index="%s*" % OsTestRunStore.INDEX_PREFIX, body=query)
+        result = self.client.search(index=OsTestRunStore._read_index_pattern(), body=query)
         hits = result["hits"]["total"]
         # OpenSearch 1.0+
         if isinstance(hits, dict):
@@ -1727,15 +1774,21 @@ class OsTestRunStore(TestRunStore):
                 "bool": {
                     "filter": [
                         {
-                            "term": {
-                                "test-run-id": test_run_id
+                            # back-compat: match docs written with either 3.x test-execution-id
+                            # or pre-3.x test-run-id.
+                            "bool": {
+                                "should": [
+                                    {"term": {"test-execution-id": test_run_id}},
+                                    {"term": {"test-run-id": test_run_id}}
+                                ],
+                                "minimum_should_match": 1
                             }
                         }
                     ]
                 }
             }
         }
-        result = self.client.search(index="%s*" % OsTestRunStore.INDEX_PREFIX, body=query)
+        result = self.client.search(index=OsTestRunStore._read_index_pattern(), body=query)
         hits = result["hits"]["total"]
         # OpenSearch 1.0+
         if isinstance(hits, dict):

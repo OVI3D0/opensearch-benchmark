@@ -295,7 +295,8 @@ class CloudWatchMetricsStore(MetricsStore):
     def _filter_clause(self, name, task, operation_type, sample_type, node_name):
         """Build the ``filter`` clause shared by every read-side query."""
         safe_name = self._escape_query_value(name)
-        parts = [f'TestRunId = "{self._test_run_id}"']
+        # back-compat: match events written with either 3.x TestExecutionId or pre-3.x TestRunId.
+        parts = [f'(TestRunId = "{self._test_run_id}" or TestExecutionId = "{self._test_run_id}")']
         parts.append(f'ispresent(`{safe_name}`)')
         if task is not None:
             parts.append(f'Task = "{self._escape_query_value(task)}"')

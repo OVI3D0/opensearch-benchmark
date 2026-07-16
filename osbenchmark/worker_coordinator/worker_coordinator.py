@@ -540,7 +540,11 @@ class FeedbackActor(actor.BenchmarkActor):
                 "bool": {
                 "filter": [
                     { "term":  { "name": "node-stats" }},
-                    { "term":  { "test-run-id": self.test_run_id }},
+                    # back-compat: match docs written with either 3.x test-execution-id or pre-3.x test-run-id.
+                    { "bool": { "should": [
+                        { "term": { "test-execution-id": self.test_run_id }},
+                        { "term": { "test-run-id": self.test_run_id }}
+                    ], "minimum_should_match": 1 }},
                     { "range": { "@timestamp": { "gte": f"now-{self.cpu_window_seconds}s", "lte": "now" }}}
                 ]
                 }
