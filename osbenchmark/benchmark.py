@@ -319,7 +319,7 @@ def create_arg_parser():
         "--test-executions-id",
         "--test-runs-id",
         "-tid",
-        dest="test_executions_id",
+        dest="test_execution_id",
         help="Define a unique id for this aggregated test-execution.",
         default="")
     aggregate_parser.add_argument(
@@ -1096,7 +1096,7 @@ def configure_connection_params(arg_parser, args, cfg):
     cfg.add(config.Scope.applicationOverride, "client", "grpc_hosts", grpc_target_hosts)
 
     # Configure database backend; worker_coordinator reads cfg.opts("database", "type")
-    # to pick the DatabaseClient factory via the database/ registry.
+    # to pick the engine via osbenchmark.engine.get_engine().
     database_type = getattr(args, "database_type", "opensearch")
     cfg.add(config.Scope.applicationOverride, "database", "type", database_type)
     if "timeout" not in client_options.default:

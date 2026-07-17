@@ -28,6 +28,7 @@ Argument | Description | Required
 `pipeline` | Steps required to run a test, including provisioning an OpenSearch from source code or a specified distribution. Defaults to `from-sources` which provisions an OpenSearch cluster from source code. | No
 `distribution-version` | The OpenSearch version to use for a given test. Defining a version can be useful when using a `pipeline` that includes provisioning. When using a `pipeline` without provisioning, OSB will automatically determine the version | No
 `target-hosts` | The OpenSearch endpoint(s) to run a test against. This should only be specified with  `--pipeline=benchmark-only`  | No
+`database-type` | The target database engine to benchmark. Accepted values are `opensearch`, `vespa`, `milvus`, and `clickhouse` (default: `opensearch`). | No
 `test-mode` | Run a single iteration of each operation in the test procedure. The test provides a quick way for sanity checking a testing configuration. Therefore, do not use `test-mode` for actual benchmarking. | No
 `kill-running-processes` | Kill any running OpenSearch Benchmark processes on the local machine before the test runs. | No
 
@@ -81,6 +82,7 @@ Argument | Description | Required
 `target-hosts` | Define a comma-separated list of host:port pairs which should be targeted if using the pipeline 'benchmark-only' (default: `localhost:9200`). | No
 `worker-ips` | Define a comma-separated list of hosts which should generate load (default: `localhost`). | No
 `client-options` | Define a comma-separated list of client options to use. The options will be passed to the OpenSearch Python client (default: `timeout:60`). | No
+`database-type` | Define the target database engine. Supported engines are `opensearch`, `vespa`, `milvus`, and `clickhouse` (default: `opensearch`). | No
 `on-error` | Controls how OSB behaves on response errors. Options are `continue` and `abort` (default: `continue`). | No
 `telemetry` | Enable the provided telemetry devices, provided as a comma-separated list. List possible telemetry devices with `opensearch-benchmark list telemetry`. | No
 `telemetry-params` | Define a comma-separated list of key:value pairs that are injected verbatim to the telemetry devices as parameters. | No

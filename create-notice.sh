@@ -78,6 +78,11 @@ function main {
     add_license "botocore" "https://raw.githubusercontent.com/boto/botocore/develop/LICENSE.txt"
     # google-resumable-media dependencies
     add_license "google-crc32c": "https://raw.githubusercontent.com/googleapis/python-crc32c/master/LICENSE"
+
+    # optional engine extras (installed via opensearch-benchmark[vespa|milvus|clickhouse])
+    add_license "pyvespa" "https://raw.githubusercontent.com/vespa-engine/pyvespa/master/LICENSE"
+    add_license "pymilvus" "https://raw.githubusercontent.com/milvus-io/pymilvus/master/LICENSE"
+    add_license "clickhouse-connect" "https://raw.githubusercontent.com/ClickHouse/clickhouse-connect/main/LICENSE"
 }
 
 main
