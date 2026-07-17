@@ -120,6 +120,27 @@ class TestConfigLoad:
         c = cw_config_mod.load(cfg)
         assert c.log_retention_days == 1096
 
+    def test_bare_log_group_used_as_default_for_all(self):
+        # L1: a bare `datastore.log_group = X` (no dotted sub-key) is a
+        # shared default for all three specific groups instead of being
+        # silently ignored.
+        cfg = _Cfg({("reporting", "datastore.log_group"): "shared-lg"})
+        c = cw_config_mod.load(cfg)
+        assert c.metrics_log_group == "shared-lg"
+        assert c.test_executions_log_group == "shared-lg"
+        assert c.results_log_group == "shared-lg"
+
+    def test_specific_log_group_key_overrides_bare_default(self):
+        # L1: a specific sub-key still wins over the bare default.
+        cfg = _Cfg({
+            ("reporting", "datastore.log_group"): "shared-lg",
+            ("reporting", "datastore.log_group.metrics"): "metrics-specific",
+        })
+        c = cw_config_mod.load(cfg)
+        assert c.metrics_log_group == "metrics-specific"
+        assert c.test_executions_log_group == "shared-lg"
+        assert c.results_log_group == "shared-lg"
+
 
 # ---------------------------------------------------------------------- EMF
 
@@ -432,6 +453,34 @@ class TestLogStreamWriter:
         sent = w.write_batch(events)
         assert sent == 1
         assert "exceeds" in caplog.text
+
+    def test_per_event_cap_is_256kb_not_1mib(self):
+        # M3: CloudWatch's per-event max is 256 KB, not the 1 MiB batch cap.
+        # An event in the 256 KB..1 MiB range must be treated as oversized.
+        from osbenchmark.metrics_stores.cloudwatch.log_streams import (
+            _MAX_BATCH_BYTES as batch_cap,
+            _PER_EVENT_OVERHEAD_BYTES as overhead,
+        )
+        assert _MAX_EVENT_BYTES == 262_144 - overhead
+        assert batch_cap == 1_048_576
+        assert _MAX_EVENT_BYTES < batch_cap
+
+    def test_dropped_event_count_reconciled_in_log(self, fake_logs_client, caplog):
+        # L2: the reconciled ship count must surface dropped events so
+        # "shipped N" never silently overstates delivery.
+        import logging
+        w = LogStreamWriter(fake_logs_client, "g", "s")
+        huge = "x" * (_MAX_EVENT_BYTES + 1)
+        events = [
+            {"timestamp": 1, "message": huge},  # dropped
+            {"timestamp": 2, "message": "ok"},  # shipped
+            {"timestamp": 3, "message": "ok2"},  # shipped
+        ]
+        with caplog.at_level(logging.WARNING):
+            sent = w.write_batch(events)
+        assert sent == 2
+        assert "shipped 2 of 3" in caplog.text
+        assert "1 event(s) were dropped" in caplog.text
 
     def test_throttle_retried(self, fake_logs_client):
         # 2 throttles then success

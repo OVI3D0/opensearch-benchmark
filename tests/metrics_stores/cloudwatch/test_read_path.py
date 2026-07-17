@@ -389,6 +389,92 @@ class TestMetricsStoreReads:
         task_part = q[q.index("Task ="):q.index("Task =") + 60]
         assert "`" not in task_part[task_part.index('"') + 1:task_part.rindex('"')]
 
+    def test_recall_metric_name_sanitized_on_read(self, fake_logs_client, open_store):
+        # H1: recall@k is stored (write path) under the sanitized key
+        # recall_k; the read path must query the SAME sanitized field name,
+        # not the raw recall@k, or the metric is never found.
+        fake_logs_client.queue_query_results([])
+        store = open_store()
+        store.get_stats("recall@k")
+        q = fake_logs_client.start_query_calls[-1]["queryString"]
+        assert "recall_k" in q
+        assert "recall@k" not in q
+
+    def test_get_one_sort_key_translated_to_emf_field(self, fake_logs_client, open_store):
+        # M1: duration() sorts on canonical `relative-time-ms`, but the EMF
+        # write path stores it as RelativeTimeMs — the sort must reference
+        # the stored name so it orders on a populated field.
+        fake_logs_client.queue_query_results(make_insights_rows([
+            {"service_time": "12.3", "RelativeTimeMs": "1234.5"}
+        ]))
+        store = open_store()
+        store.get_one("service_time", sort_key="relative-time-ms", sort_reverse=True)
+        q = fake_logs_client.start_query_calls[-1]["queryString"]
+        assert "sort `RelativeTimeMs` desc" in q
+        assert "relative-time-ms" not in q
+
+    def test_get_raw_skips_rows_missing_mapper_field(self, fake_logs_client, open_store):
+        # M2: shard_stats maps onto doc['per-shard'], which the EMF write
+        # path never persists. get_raw must skip such rows (fail-soft) rather
+        # than let the KeyError abort the whole result calculation.
+        fake_logs_client.queue_query_results(make_insights_rows([
+            {"indexing_total_time": "100", "Task": "index"},
+        ]))
+        store = open_store()
+        result = store.get_raw("indexing_total_time",
+                               mapper=lambda doc: doc["per-shard"])
+        assert result == []
+
+    def test_get_raw_reconstructs_ml_fields(self, fake_logs_client, open_store):
+        # M2: ml_processing_time_stats reads job/min/mean/median/max, which
+        # the telemetry write path persists as queryable top-level fields.
+        fake_logs_client.queue_query_results(make_insights_rows([
+            {"ml_processing_time": "5", "job": "job-1", "min": "1.0",
+             "mean": "2.0", "median": "2.0", "max": "3.0"},
+        ]))
+        store = open_store()
+        rows = store.get_raw("ml_processing_time")
+        assert len(rows) == 1
+        assert rows[0]["job"] == "job-1"
+        assert rows[0]["min"] == 1.0
+        assert rows[0]["max"] == 3.0
+
+    def test_get_raw_reconstructs_transform_id(self, fake_logs_client, open_store):
+        # M2: total_transform_metric keys off meta.transform_id.
+        fake_logs_client.queue_query_results(make_insights_rows([
+            {"transform_search_total": "42", "meta.transform_id": "t-1",
+             "Unit": "docs"},
+        ]))
+        store = open_store()
+        rows = store.get_raw("transform_search_total")
+        assert rows[0]["meta"]["transform_id"] == "t-1"
+
+    def test_flush_refresh_waits_for_ingest(self, fake_logs_client, open_store):
+        # B1: flush(refresh=True) must poll Insights until the current run's
+        # events are visible before returning, bridging CW's ingest lag.
+        store = open_store()
+        store.put_value_cluster_level(
+            name="service_time", value=1.0, unit="ms", task="term",
+            operation="term", operation_type="search")
+        # Ingest becomes visible: the count probe returns a positive count.
+        fake_logs_client.queue_query_results(
+            make_insights_rows([{"count": "1"}]))
+        store.flush(refresh=True)
+        # A count(*) probe scoped to this run must have been issued.
+        probes = [c["queryString"] for c in fake_logs_client.start_query_calls]
+        assert any("stats count(*) as count" in q
+                   and 'TestExecutionId = "abc-123"' in q for q in probes)
+
+    def test_flush_no_refresh_skips_ingest_wait(self, fake_logs_client, open_store):
+        # B1: intermediate flushes (refresh=False) stay fast — no probe.
+        store = open_store()
+        store.put_value_cluster_level(
+            name="service_time", value=1.0, unit="ms", task="term",
+            operation="term", operation_type="search")
+        store.flush(refresh=False)
+        probes = [c["queryString"] for c in fake_logs_client.start_query_calls]
+        assert not any("stats count(*) as count" in q for q in probes)
+
 
 # ------------------------------------------------------ CloudWatchTestExecutionStore reads
 

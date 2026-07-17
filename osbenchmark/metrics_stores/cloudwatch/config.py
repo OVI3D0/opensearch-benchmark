@@ -73,8 +73,15 @@ def load(cfg) -> CloudWatchConfig:
     region = _opt_str(cfg, "datastore.region", default=None)
     namespace = _opt_str(cfg, "datastore.namespace", default="OSB")
 
+    # A bare ``datastore.log_group = X`` (no dotted sub-key) is accepted as a
+    # shared default for all three specific groups; a specific sub-key still
+    # wins when set. Without this, a bare key was silently ignored and the
+    # user's data landed in the built-in default groups with no warning.
+    bare_log_group = _opt_str(cfg, "datastore.log_group", default=None)
+
     metrics_log_group = _opt_str(
-        cfg, "datastore.log_group.metrics", default="benchmark-metrics")
+        cfg, "datastore.log_group.metrics",
+        default=bare_log_group or "benchmark-metrics")
     # back-compat: prefer the 3.x key datastore.log_group.test_executions, fall back to the
     # pre-3.x key datastore.log_group.test_runs. Read-side only — the write target is unchanged
     # and the old default group benchmark-test-runs stays readable.
@@ -82,9 +89,11 @@ def load(cfg) -> CloudWatchConfig:
         cfg, "datastore.log_group.test_executions", default=None)
     if test_executions_log_group is None:
         test_executions_log_group = _opt_str(
-            cfg, "datastore.log_group.test_runs", default="benchmark-test-runs")
+            cfg, "datastore.log_group.test_runs",
+            default=bare_log_group or "benchmark-test-runs")
     results_log_group = _opt_str(
-        cfg, "datastore.log_group.results", default="benchmark-results")
+        cfg, "datastore.log_group.results",
+        default=bare_log_group or "benchmark-results")
 
     retention_raw = cfg.opts("reporting", "datastore.log_retention_days",
                              default_value=None, mandatory=False)

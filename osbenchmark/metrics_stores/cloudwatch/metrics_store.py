@@ -43,6 +43,7 @@ import time as _time
 from osbenchmark import time
 from osbenchmark.metrics import MetricsStore
 from osbenchmark.metrics_stores.cloudwatch import emf, insights
+from osbenchmark.metrics_stores.cloudwatch.emf import _sanitize_metric_name
 from osbenchmark.metrics_stores.cloudwatch.client import CloudWatchClientFactory
 from osbenchmark.metrics_stores.cloudwatch.config import (
     CloudWatchConfig,
@@ -66,6 +67,18 @@ _MAX_BUFFERED_BYTES = _MAX_BATCH_BYTES
 # substitute anything outside it with `_` so user-supplied workload names
 # (which can contain spaces or other characters) don't fail at provisioning.
 _VALID_STREAM_CHARS = re.compile(r"[^\w\-\./#]+")
+
+# End-of-run ingest-visibility wait (see flush(refresh=True)). CloudWatch
+# Logs has a documented multi-second delay between PutLogEvents returning
+# and the events becoming queryable via Logs Insights. calculate_results()
+# reads the just-written samples back milliseconds after the final flush,
+# so on refresh=True we poll Insights until the current test-execution's
+# events are visible before returning. Bounded so a slow/failed ingest
+# still lets the run finish (with blank results, logged as a warning)
+# rather than hanging.
+_REFRESH_MAX_WAIT_SECONDS = 90.0
+_REFRESH_BASE_BACKOFF_SECONDS = 1.0
+_REFRESH_MAX_BACKOFF_SECONDS = 10.0
 
 
 class CloudWatchMetricsStore(MetricsStore):
@@ -202,13 +215,24 @@ class CloudWatchMetricsStore(MetricsStore):
         """
         Ship the in-memory buffer to CloudWatch Logs.
 
-        :param refresh: Accepted for interface parity with the OpenSearch
-            metrics store; CloudWatch Logs has no index-refresh concept.
+        :param refresh: When ``True`` (the end-of-run flush issued by
+            ``on_benchmark_complete`` before ``calculate_results`` reads the
+            samples back), block until the just-shipped events are queryable
+            via Logs Insights so the derived run summary/results aren't
+            computed against not-yet-ingested data. CloudWatch Logs has a
+            documented multi-second ingest delay, so without this wait the
+            read races the ingest and the summary comes back blank.
+            Intermediate flushes (``refresh=False``) skip the wait so
+            buffer-full flushes stay fast.
 
         On a transient write failure the buffer is restored so a follow-up
         flush can retry the same events rather than losing them.
         """
         if not self._buffered_events:
+            if refresh:
+                # Even with an empty buffer, a prior refresh=False flush may
+                # have shipped events that aren't queryable yet; wait for them.
+                self._wait_for_ingest()
             return
         if self._writer is None:
             raise RuntimeError(
@@ -231,6 +255,61 @@ class CloudWatchMetricsStore(MetricsStore):
         self.logger.info(
             "CloudWatch datastore: shipped %d EMF events to %s in %.3fs",
             sent, self._cw_config.metrics_log_group, sw.total_time())
+        if refresh:
+            self._wait_for_ingest()
+
+    def _wait_for_ingest(self):
+        """
+        Poll Logs Insights until at least one event for the current
+        test-execution is queryable, or until ``_REFRESH_MAX_WAIT_SECONDS``
+        elapses. Bridges CloudWatch Logs' PutLogEvents-to-Insights ingest
+        lag so ``calculate_results`` reads populated data.
+
+        Returns without waiting if the store was never opened for writes
+        (no read client available). Once the cumulative backoff budget
+        reaches ``_REFRESH_MAX_WAIT_SECONDS``, logs a WARNING and returns so
+        the run still completes (with a possibly-blank summary) rather than
+        hanging indefinitely. Sleeps via ``insights._safe_sleep`` so the
+        wait shares the read path's test-time monkeypatch.
+        """
+        if self._writer is None:
+            # Read-only store (never opened for writes) — nothing was shipped
+            # from this instance, so there is nothing to wait for.
+            return
+        # Scope the probe to this run so we never see a prior run's events.
+        query = (
+            f'filter (TestRunId = "{self._test_execution_id}" '
+            f'or TestExecutionId = "{self._test_execution_id}")\n'
+            f"| stats count(*) as count"
+        )
+        attempt = 0
+        waited = 0.0
+        while True:
+            rows = self._run_insights(query, limit=1)
+            count = 0
+            if rows:
+                count = int(insights.to_float(rows[0].get("count")) or 0)
+            if count > 0:
+                self.logger.info(
+                    "CloudWatch datastore: ingest visible after %d probe(s); "
+                    "results are queryable.", attempt + 1)
+                return
+            if waited >= _REFRESH_MAX_WAIT_SECONDS:
+                self.logger.warning(
+                    "CloudWatch datastore: events for test execution %s were "
+                    "not queryable within %.0fs of the final flush; the run "
+                    "summary/results may be blank. Raw samples are preserved "
+                    "in CloudWatch Logs and remain queryable once ingest "
+                    "completes.",
+                    self._test_execution_id, _REFRESH_MAX_WAIT_SECONDS)
+                return
+            wait = min(
+                _REFRESH_MAX_BACKOFF_SECONDS,
+                _REFRESH_BASE_BACKOFF_SECONDS * (2 ** attempt),
+            )
+            insights._safe_sleep(wait)
+            waited += wait
+            attempt += 1
 
     def to_externalizable(self, clear=False):
         # Buffered events have already been transformed to EMF; we don't
@@ -292,9 +371,22 @@ class CloudWatchMetricsStore(MetricsStore):
         """
         return str(value).replace("`", "_").replace('"', "_")
 
+    @staticmethod
+    def _field_name(name):
+        """
+        Canonical transform for a metric *name* when it is used as a queried
+        field. The write path stores the metric under the key produced by
+        ``emf._sanitize_metric_name`` (e.g. ``recall@k`` -> ``recall_k``),
+        so reads MUST apply the same transform or they query a field that
+        was never written. This differs from ``_escape_query_value`` (which
+        only strips backticks/quotes for injection safety and leaves ``@``
+        intact) and is used for field *names*, not field *values*.
+        """
+        return _sanitize_metric_name(str(name))
+
     def _filter_clause(self, name, task, operation_type, sample_type, node_name):
         """Build the ``filter`` clause shared by every read-side query."""
-        safe_name = self._escape_query_value(name)
+        safe_name = self._field_name(name)
         # back-compat: match events written with either 3.x TestExecutionId or pre-3.x TestRunId.
         parts = [f'(TestRunId = "{self._test_execution_id}" or TestExecutionId = "{self._test_execution_id}")']
         parts.append(f'ispresent(`{safe_name}`)')
@@ -361,26 +453,57 @@ class CloudWatchMetricsStore(MetricsStore):
             doc["unit"] = row["Unit"]
         if row.get("RelativeTimeMs") is not None:
             doc["relative-time-ms"] = insights.to_float(row["RelativeTimeMs"])
+        # Telemetry / aggregate fields consumed by GlobalStatsCalculator's
+        # ml_processing_time_stats (job/min/mean/median/max) — reconstructed
+        # when present so those summaries aren't silently empty. Numerics are
+        # coerced; ``job`` stays a string.
+        if row.get("job") is not None:
+            doc["job"] = row["job"]
+        for agg_field in ("min", "mean", "median", "max"):
+            if row.get(agg_field) is not None:
+                doc[agg_field] = insights.to_float(row[agg_field])
         meta = {}
         if row.get("meta.node_name") is not None:
             meta["node_name"] = row["meta.node_name"]
         if row.get("meta.success") is not None:
             meta["success"] = row["meta.success"]
+        # total_transform_metric keys off meta.transform_id.
+        if row.get("meta.transform_id") is not None:
+            meta["transform_id"] = row["meta.transform_id"]
         if meta:
             doc["meta"] = meta
         return doc
 
     # Common set of fields fetched alongside the metric value so the
     # caller's mapper can read any of OSB's standard doc fields without
-    # the read path having to guess at intent.
+    # the read path having to guess at intent. Includes the telemetry
+    # aggregate fields (job/min/mean/median/max) and meta.transform_id so
+    # ml_processing_time_stats / total_transform_metric can reconstruct
+    # their docs. ``per-shard`` is intentionally absent: the EMF write path
+    # (build_event) does not persist it, so it cannot be reconstructed —
+    # get_raw guards against the resulting missing key (see get_raw).
     _DEFAULT_FIELDS_QUERY = (
         "Task, OperationType, Operation, SampleType, Unit, "
-        "RelativeTimeMs, `meta.node_name`, `meta.success`"
+        "RelativeTimeMs, `min`, mean, median, `max`, job, "
+        "`meta.node_name`, `meta.success`, `meta.transform_id`"
     )
+
+    # OSB callers pass canonical (dashed) doc field names as sort keys (e.g.
+    # ``duration()`` sorts on ``relative-time-ms``), but the EMF write path
+    # stores those under PascalCase top-level keys. Translate so the sort
+    # actually orders on a populated field instead of a null one.
+    _CANONICAL_TO_EMF_FIELD = {
+        "relative-time-ms": "RelativeTimeMs",
+        "operation-type": "OperationType",
+        "sample-type": "SampleType",
+        "task": "Task",
+        "operation": "Operation",
+        "unit": "Unit",
+    }
 
     def _get(self, name, task, operation_type, sample_type, node_name, mapper):
         filter_ = self._filter_clause(name, task, operation_type, sample_type, node_name)
-        safe_name = self._escape_query_value(name)
+        safe_name = self._field_name(name)
         query = (
             f"filter {filter_}\n"
             f"| fields `{safe_name}`, {self._DEFAULT_FIELDS_QUERY}\n"
@@ -389,13 +512,59 @@ class CloudWatchMetricsStore(MetricsStore):
         rows = self._run_insights(query)
         return [mapper(self._row_to_doc(row, name)) for row in rows]
 
+    def get_raw(self, name, task=None, operation_type=None, sample_type=None,
+                node_name=None, mapper=lambda doc: doc):
+        """
+        Guarded ``get_raw``: some callers map onto nested fields the EMF
+        write path does not persist (notably ``shard_stats`` reads
+        ``doc['per-shard']``, which ``emf.build_event`` never stores). The
+        parent would let the mapper raise ``KeyError`` and abort result
+        calculation for the whole run. Here we materialize each row, then
+        skip rows whose mapper raises ``KeyError`` (missing reconstructed
+        field) so a metric that can't be fully reconstructed yields an empty
+        result — matching the fail-soft contract of the other read methods —
+        rather than crashing the summary.
+        """
+        filter_ = self._filter_clause(name, task, operation_type, sample_type, node_name)
+        safe_name = self._field_name(name)
+        query = (
+            f"filter {filter_}\n"
+            f"| fields `{safe_name}`, {self._DEFAULT_FIELDS_QUERY}\n"
+            f"| limit 10000"
+        )
+        rows = self._run_insights(query)
+        results = []
+        skipped = 0
+        for row in rows:
+            doc = self._row_to_doc(row, name)
+            try:
+                results.append(mapper(doc))
+            except KeyError as e:
+                skipped += 1
+                self.logger.debug(
+                    "get_raw(%s): skipping row missing field %s "
+                    "(not reconstructable from EMF)", name, e)
+        if skipped:
+            self.logger.warning(
+                "CloudWatch datastore: get_raw(%s) skipped %d of %d row(s) "
+                "lacking a field the caller requires (e.g. per-shard stats "
+                "are not persisted by the EMF write path); that aggregate "
+                "will be empty in the summary.", name, skipped, len(rows))
+        return results
+
     def get_one(self, name, sample_type=None, node_name=None, task=None,
                 mapper=lambda doc: doc["value"],
                 sort_key=None, sort_reverse=False):
         filter_ = self._filter_clause(name, task, None, sample_type, node_name)
         order = "desc" if sort_reverse else "asc"
-        sort_field = sort_key if sort_key else "@timestamp"
-        safe_name = self._escape_query_value(name)
+        # Translate canonical OSB field names (e.g. ``relative-time-ms``) to
+        # the EMF stored name (``RelativeTimeMs``) so the sort orders on a
+        # field that actually carries a value.
+        if sort_key:
+            sort_field = self._CANONICAL_TO_EMF_FIELD.get(sort_key, sort_key)
+        else:
+            sort_field = "@timestamp"
+        safe_name = self._field_name(name)
         # Always fetch the full default field set so mappers like
         # ``doc["relative-time-ms"]`` or ``doc["unit"]`` resolve to
         # properly-typed values regardless of which sort key the caller
@@ -439,7 +608,7 @@ class CloudWatchMetricsStore(MetricsStore):
         """Return a dict compatible with the OS ``stats`` aggregation:
         ``{count, min, max, avg, sum}``."""
         filter_ = self._filter_clause(name, task, operation_type, sample_type, None)
-        safe_name = self._escape_query_value(name)
+        safe_name = self._field_name(name)
         query = (
             f"filter {filter_}\n"
             f"| stats min(`{safe_name}`) as min, max(`{safe_name}`) as max, "
@@ -466,7 +635,7 @@ class CloudWatchMetricsStore(MetricsStore):
         if percentiles is None:
             percentiles = [99, 99.9, 100]
         filter_ = self._filter_clause(name, task, operation_type, sample_type, None)
-        safe_name = self._escape_query_value(name)
+        safe_name = self._field_name(name)
 
         # Build the stats list. Insights's pct() doesn't accept 100; use
         # max() for the p100 case so we always return a numeric value.

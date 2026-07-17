@@ -28,7 +28,7 @@ LogStreamWriter that ships pre-formatted JSON log events to one stream
 via PutLogEvents.
 
 The writer handles CloudWatch's batch limits (10,000 events, 1 MiB
-payload, single event 1 MiB) by chunking the caller's batch as needed,
+batch payload, 256 KB single event) by chunking the caller's batch as needed,
 and retries on ThrottlingException with exponential backoff. Sequence
 tokens are no longer required as of CloudWatch Logs' 2023 deprecation, so
 multiple workers can write to distinct streams under the same log group
@@ -44,10 +44,16 @@ import botocore.exceptions
 
 # CloudWatch PutLogEvents limits (see cloudwatch-apis.md for sources).
 _MAX_EVENTS_PER_BATCH = 10_000
+# Aggregate cap on a single PutLogEvents *batch* (1 MiB).
 _MAX_BATCH_BYTES = 1_048_576
 _PER_EVENT_OVERHEAD_BYTES = 26
-# CloudWatch rejects single log events larger than this.
-_MAX_EVENT_BYTES = 1_048_576 - _PER_EVENT_OVERHEAD_BYTES
+# CloudWatch rejects a single log *event* larger than 256 KB. This is a
+# distinct, smaller limit than the 1 MiB batch cap above — an event in the
+# 256 KB..1 MiB range would pass a batch-derived guard but then make
+# PutLogEvents reject the whole batch with a non-retryable
+# InvalidParameterException. Cap per-event at 256 KB minus the per-event
+# overhead so oversized events are dropped/skipped before they poison a batch.
+_MAX_EVENT_BYTES = 262_144 - _PER_EVENT_OVERHEAD_BYTES
 
 # Retry policy for transient errors. Throttling is the common case; back off
 # exponentially with jitter and cap the wait so a stuck run still progresses.
@@ -158,11 +164,15 @@ class LogStreamWriter:
             dicts. The list is sorted in place by timestamp before chunking.
         :return: Number of events actually sent. Events whose ``message``
             exceeds CloudWatch's per-event byte limit are dropped with a
-            warning rather than failing the whole batch.
+            warning rather than failing the whole batch; a reconciled
+            "shipped N, dropped M of TOTAL" line is logged whenever any
+            event was dropped so the ship count never silently overstates
+            delivery.
         """
         if not events:
             return 0
 
+        total = len(events)
         # CloudWatch requires events in a batch to be sorted chronologically.
         ordered = sorted(events, key=lambda e: e["timestamp"])
 
@@ -170,6 +180,13 @@ class LogStreamWriter:
         for chunk in self._chunk(ordered):
             self._put_with_retry(chunk)
             sent += len(chunk)
+        dropped = total - sent
+        if dropped:
+            self._logger.warning(
+                "CloudWatch datastore: shipped %d of %d event(s) to %s; "
+                "%d event(s) were dropped for exceeding the per-event byte "
+                "limit and were NOT delivered.",
+                sent, total, self._log_group, dropped)
         return sent
 
     def _chunk(self, events: Iterable[dict]) -> Iterable[List[dict]]:
