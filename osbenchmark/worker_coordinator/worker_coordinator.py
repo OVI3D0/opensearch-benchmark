@@ -966,33 +966,19 @@ class WorkerCoordinator:
         self.complete_current_task_sent = False
 
         self.telemetry = None
-        # Caches the DatabaseClientFactory per cluster for non-OpenSearch backends
-        # so the same instance can be reused by wait_for_rest_api without a second
-        # construction.
-        self._database_factories = {}
 
     def create_os_clients(self):
         all_hosts = self.config.opts("client", "hosts").all_hosts
-        database_type = self.config.opts("database", "type", default_value="opensearch", mandatory=False)
         opensearch = {}
         for cluster_name, cluster_hosts in all_hosts.items():
             all_client_options = self.config.opts("client", "options").all_client_options
             cluster_client_options = dict(all_client_options[cluster_name])
             # Use retries to avoid aborts on long living connections for telemetry devices
             cluster_client_options["retry-on-timeout"] = True
-            if database_type.lower() == "opensearch":
-                opensearch[cluster_name] = self.os_client_factory(cluster_hosts, cluster_client_options).create()
-            else:
-                # Non-OpenSearch backends route through the registry so the right
-                # url_prefix / transport configuration is applied. This path
-                # mirrors the async create path at WorkerCoordinator.os_clients.
-                # Cache the factory so wait_for_rest_api can reuse it for the
-                # readiness probe rather than constructing a second instance.
-                db_factory = DatabaseClientFactory.create_client_factory(
-                    database_type, cluster_hosts, cluster_client_options,
-                )
-                self._database_factories[cluster_name] = db_factory
-                opensearch[cluster_name] = db_factory.create()
+            # os_client_factory is engine-aware: for non-OpenSearch backends it is
+            # engine.create_client_factory (see WorkerCoordinatorActor construction),
+            # so the same call routes correctly for every database type.
+            opensearch[cluster_name] = self.os_client_factory(cluster_hosts, cluster_client_options).create()
         return opensearch
 
     def prepare_telemetry(self, opensearch, enable):
