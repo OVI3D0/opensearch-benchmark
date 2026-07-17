@@ -249,6 +249,27 @@ class ClickHouseBulkTests(IsolatedAsyncioTestCase):
         m.command.assert_awaited_once()
         m.insert.assert_not_called()
 
+    async def test_json_fallback_quotes_table_identifier(self):
+        c, m = self._client_with_mock()
+        m.command.return_value = _summary("2000000")
+        body = [{"index": {"_id": "1"}}, {"a": 1}]
+        result = await c.bulk(body=body, index="my table", params={})
+        self.assertFalse(result["errors"])
+        m.command.assert_awaited_once()
+        stmt = m.command.await_args.args[0]
+        self.assertIn("INSERT INTO `my table` FORMAT JSONEachRow", stmt)
+
+    async def test_json_fallback_quotes_qualified_table(self):
+        c, m = self._client_with_mock()
+        m.command.return_value = _summary("2000000")
+        body = [{"index": {"_id": "1"}}, {"a": 1}]
+        result = await c.bulk(body=body, index="db.tbl", params={})
+        self.assertFalse(result["errors"])
+        m.command.assert_awaited_once()
+        stmt = m.command.await_args.args[0]
+        # db.table must quote each part separately, preserving the dot separator
+        self.assertIn("INSERT INTO `db`.`tbl` FORMAT JSONEachRow", stmt)
+
     async def test_empty_body_returns_empty(self):
         c, m = self._client_with_mock()
         result = await c.bulk(body=[], index="t", params={"column-names": ["a"]})

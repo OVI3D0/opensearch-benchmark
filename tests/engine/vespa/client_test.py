@@ -858,6 +858,26 @@ class VespaSearchTests(TestCase):
         self.assertEqual([], result["root"]["children"])
         self.assertEqual(errors, result["root"]["errors"])
 
+    @mock.patch("osbenchmark.engine.vespa.client.PYVESPA_AVAILABLE", True)
+    @run_async
+    async def test_search_vespa_error_real_failure_reraises(self):
+        """M7: a genuine query failure (not a benign sort-attribute warning) must
+        propagate so the runner records success=False, rather than being folded
+        into latency/throughput as a fabricated zero-hit success."""
+        client = _make_client()
+        mock_sync = mock.MagicMock()
+        errors = [{"code": 4, "message": "Invalid query: could not parse YQL"}]
+        mock_sync.query.side_effect = vespa_mod.VespaError(errors)
+        client._sync_session = mock_sync
+        client._search_executor = mock.MagicMock()
+
+        async def fake_executor(executor, fn):
+            return fn()
+        with mock.patch("asyncio.get_running_loop") as mock_loop:
+            mock_loop.return_value.run_in_executor = fake_executor
+            with self.assertRaises(vespa_mod.VespaError):
+                await client.search(body={"yql": "select * from t where bogus"})
+
     @mock.patch("osbenchmark.engine.vespa.client.PYVESPA_AVAILABLE", False)
     @run_async
     async def test_search_aiohttp_fallback_sends_post(self):

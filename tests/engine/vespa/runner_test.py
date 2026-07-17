@@ -477,13 +477,45 @@ class VespaVectorSearchRunnerTests(TestCase):
         runner = VespaVectorSearch()
         self.assertEqual(repr(runner), "vespa-vector-search")
 
+    def test_topk_recall_coerces_types(self):
+        # M5 regression: predictions from _extract_doc_id are str while ground
+        # truth neighbors may be int / numpy.int64. Both sides must be coerced
+        # to str before the membership test, otherwise recall is always 0.0.
+        predictions = ["1", "2", "3"]  # str, as produced by _extract_doc_id
+        neighbors = [1, 2, 3, 4, 5]    # int-typed ground truth
+        recall = VespaVectorSearch._calculate_topk_recall(predictions, neighbors, 3)
+        self.assertEqual(recall, 1.0)
+
+    def test_topk_recall_partial(self):
+        predictions = ["1", "99", "3"]
+        neighbors = [1, 2, 3]
+        recall = VespaVectorSearch._calculate_topk_recall(predictions, neighbors, 3)
+        self.assertAlmostEqual(recall, 2.0 / 3.0)
+
+    def test_topk_recall_filters_sentinel(self):
+        # -1 sentinels are dropped from the truth set regardless of element type
+        predictions = ["1", "2"]
+        neighbors = [1, 2, -1, -1]
+        recall = VespaVectorSearch._calculate_topk_recall(predictions, neighbors, 4)
+        self.assertEqual(recall, 1.0)
+
+    def test_topk_recall_none_neighbors(self):
+        self.assertEqual(VespaVectorSearch._calculate_topk_recall(["1"], None, 1), 0.0)
+
 
 class VespaBulkVectorDataSetRunnerTests(TestCase):
+
+    @staticmethod
+    def _bulk_ok(n):
+        """A successful bulk() return: n docs, all status 200."""
+        return {"took": 0, "errors": False,
+                "items": [{"index": {"_id": str(i), "status": 200}} for i in range(n)]}
 
     @mock.patch("osbenchmark.engine.vespa.runners.request_context_holder")
     @run_async
     async def test_bulk_vector_calls_bulk(self, mock_ctx):
         vespa_client = _make_vespa_client()
+        vespa_client.bulk.return_value = self._bulk_ok(2)
 
         # Vectorsearch workload produces alternating action/doc pairs
         body = [
@@ -510,6 +542,7 @@ class VespaBulkVectorDataSetRunnerTests(TestCase):
     @run_async
     async def test_bulk_vector_returns_size_and_docs(self, mock_ctx):
         vespa_client = _make_vespa_client()
+        vespa_client.bulk.return_value = self._bulk_ok(1)
 
         body = [
             {"index": {"_index": "vectors", "_id": 0}},
@@ -524,8 +557,44 @@ class VespaBulkVectorDataSetRunnerTests(TestCase):
 
     @mock.patch("osbenchmark.engine.vespa.runners.request_context_holder")
     @run_async
+    async def test_bulk_vector_reports_errors(self, _mock_ctx):
+        # H2 regression: when bulk() reports feed errors, the runner must NOT
+        # report unconditional success — it returns an error result dict so
+        # execute_single records success=False instead of fabricating throughput.
+        vespa_client = _make_vespa_client()
+        vespa_client.bulk.return_value = {
+            "took": 0, "errors": True,
+            "items": [
+                {"index": {"_id": "0", "status": 200}},
+                {"index": {"_id": "1", "status": 507}},
+                {"index": {"_id": "2", "error": "connection reset"}},
+            ],
+        }
+
+        body = [
+            {"index": {"_index": "vectors", "_id": 0}},
+            {"embedding": [1.0]},
+            {"index": {"_index": "vectors", "_id": 1}},
+            {"embedding": [2.0]},
+            {"index": {"_index": "vectors", "_id": 2}},
+            {"embedding": [3.0]},
+        ]
+        params = {"body": body, "size": 3, "index": "vectors"}
+
+        runner = VespaBulkVectorDataSet()
+        result = await runner(vespa_client, params)
+
+        self.assertIsInstance(result, dict)
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error-count"], 2)
+        self.assertEqual(result["weight"], 3)
+        self.assertEqual(result["unit"], "docs")
+
+    @mock.patch("osbenchmark.engine.vespa.runners.request_context_holder")
+    @run_async
     async def test_bulk_vector_passes_index(self, mock_ctx):
         vespa_client = _make_vespa_client()
+        vespa_client.bulk.return_value = self._bulk_ok(1)
 
         body = [
             {"index": {"_index": "vectors", "_id": 0}},

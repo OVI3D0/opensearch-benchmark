@@ -58,6 +58,36 @@ except ImportError:
     PYVESPA_AVAILABLE = False
 
 
+def _search_errors_are_benign(errors) -> bool:
+    """Return True only if every Vespa search error is a non-fatal warning.
+
+    pyvespa raises VespaError only for HTTP >= 400 query responses, so a
+    raised error is a genuine query failure by default. The one class we treat
+    as non-fatal is Vespa's sort-attribute warning: a query using ``sources *``
+    that sorts on a field which is not an attribute in every source still
+    returns results, so folding it into the error rate would over-report
+    failures.
+
+    Everything else — malformed YQL, timeouts, resource-limit/backpressure
+    (429/507), backend communication errors — is a real failure that MUST be
+    surfaced so the runner records success=False rather than a fabricated
+    zero-hit success. An empty/unknown error list is treated as a failure
+    (fail-safe: never hide a genuine error).
+    """
+    if not errors:
+        return False
+    for err in errors:
+        if isinstance(err, dict):
+            message = f"{err.get('message', '')} {err.get('summary', '')}"
+        else:
+            message = str(err)
+        lowered = message.lower()
+        is_sort_warning = "sort" in lowered and ("attribute" in lowered or "is not valid" in lowered)
+        if not is_sort_warning:
+            return False
+    return True
+
+
 class VespaClientFactory:
     """Factory for creating Vespa client instances."""
 
@@ -591,19 +621,35 @@ class VespaDatabaseClient(RequestContextHolder):
                     result = self._sync_session.query(body=params)
                     return result.json
                 except VespaError as ve:
-                    # pyvespa raises on Vespa backend errors (e.g., sort attribute
-                    # warnings with sources *). Return a minimal response matching
-                    # the aiohttp passthrough behavior so the runner can handle it
-                    # as 0 hits rather than a fatal exception.
-                    errors = list(ve.args[0]) if ve.args else []
-                    self.logger.warning("Vespa search returned errors (non-fatal): %s", errors)
-                    return {
-                        "root": {
-                            "fields": {"totalCount": 0},
-                            "children": [],
-                            "errors": errors,
+                    # pyvespa raises VespaError only for HTTP >= 400 query
+                    # responses, so this is a genuine query failure by default.
+                    # ve.args[0] is either a list of error dicts (from
+                    # root.errors) or a bare message string.
+                    raw = ve.args[0] if ve.args else None
+                    if isinstance(raw, (list, tuple)):
+                        errors = list(raw)
+                    elif raw is not None:
+                        errors = [raw]
+                    else:
+                        errors = []
+                    # Only sort-attribute warnings are treated as non-fatal: the
+                    # query still returned results, so we surface a 0-hit
+                    # response the runner can accept. Every other error
+                    # (malformed YQL, timeout, resource limits, backend errors)
+                    # is re-raised so it is recorded as success=False instead of
+                    # being folded into latency/throughput as a zero-hit success.
+                    if _search_errors_are_benign(errors):
+                        self.logger.warning(
+                            "Vespa search returned non-fatal warnings: %s", errors)
+                        return {
+                            "root": {
+                                "fields": {"totalCount": 0},
+                                "children": [],
+                                "errors": errors,
+                            }
                         }
-                    }
+                    self.logger.error("Vespa search failed with errors: %s", errors)
+                    raise
 
             loop = asyncio.get_running_loop()
             try:

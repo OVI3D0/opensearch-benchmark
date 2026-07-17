@@ -190,16 +190,23 @@ class VespaVectorSearch(Runner):
 
     @staticmethod
     def _calculate_topk_recall(predictions, neighbors, top_k):
-        """Calculate recall@k by comparing predictions against ground truth neighbors."""
+        """Calculate recall@k by comparing predictions against ground truth neighbors.
+
+        Both predictions and neighbors are coerced to strings before the
+        membership test. Predictions from _extract_doc_id are str, while
+        neighbors may arrive as int / numpy.int64 depending on the dataset
+        source; comparing mixed types made ``p in truth_set`` always False
+        (recall 0.0). Coercing both sides to str eliminates that mismatch,
+        matching the Milvus adapter's approach.
+        """
         if neighbors is None:
             return 0.0
         min_results = min(top_k, len(neighbors))
-        truth_set = neighbors[:min_results]
-        # Filter out -1 sentinel values
-        truth_set = [n for n in truth_set if str(n) != "-1"]
+        # Filter out -1 sentinel values and coerce to str
+        truth_set = {str(n) for n in neighbors[:min_results] if str(n) != "-1"}
         if not truth_set:
             return 1.0
-        correct = sum(1.0 for p in predictions[:min_results] if p in truth_set)
+        correct = sum(1.0 for p in predictions[:min_results] if str(p) in truth_set)
         return correct / len(truth_set)
 
     @staticmethod
@@ -358,11 +365,37 @@ class VespaBulkVectorDataSet(Runner):
         request_context_holder.on_client_request_start()
         request_context_holder.on_request_start()
         try:
-            await vespa_client.bulk(body=prepared, index=index)
-            return size, "docs"
+            result = await vespa_client.bulk(body=prepared, index=index)
         finally:
             request_context_holder.on_request_end()
             request_context_holder.on_client_request_end()
+
+        # Inspect the bulk() return instead of assuming success. bulk() returns
+        # {"errors": bool, "items": [...]} where each failed doc carries a
+        # status >= 400 or an "error" key. Discarding this (returning a bare
+        # 2-tuple) made execute_single treat every batch as unconditional
+        # success, inflating throughput while data was silently missing. Count
+        # per-doc failures and report success=False when any occur, matching
+        # the ClickHouse/Milvus bulk-vector runners.
+        result = result or {}
+        items = result.get("items", [])
+        errors_count = sum(
+            1 for item in items
+            if isinstance(item, dict)
+            and (
+                "error" in item.get("index", {})
+                or item.get("index", {}).get("status", 200) >= 400
+            )
+        )
+        if result.get("errors") or errors_count > 0:
+            return {
+                "weight": size,
+                "unit": "docs",
+                "success": False,
+                "error-count": errors_count or 1,
+                "error-type": "vespa",
+            }
+        return size, "docs"
 
     def __repr__(self):
         return "vespa-bulk-vector-data-set"

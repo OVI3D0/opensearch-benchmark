@@ -47,7 +47,7 @@ import thespian.actors
 
 from osbenchmark import actor, config, exceptions, metrics, workload, client, paths, PROGRAM_NAME, telemetry
 from osbenchmark.worker_coordinator import runner, scheduler
-from osbenchmark.engine import get_engine
+from osbenchmark.engine import get_engine, classify_execute_error
 from osbenchmark.workload import WorkloadProcessorRegistry, load_workload, load_workload_plugins, ingestion_manager
 from osbenchmark.utils import convert, console, net
 from osbenchmark.worker_coordinator.errors import parse_error
@@ -2301,6 +2301,16 @@ class AsyncExecutor:
         self.queue_lock = queue_lock
         self.redline_enabled = self.cfg.opts("workload", "redline.test", mandatory=False) if self.cfg else False
 
+        # Resolve the active engine so execute_single can translate engine-native exceptions
+        # via its optional on_execute_error hook (restoring fatal-error -> abort parity for
+        # non-OpenSearch engines). Defaults to "opensearch" when no config is available.
+        db_type = self.cfg.opts("database", "type", default_value="opensearch",
+                                mandatory=False).lower() if self.cfg else "opensearch"
+        try:
+            self.engine = get_engine(db_type)
+        except exceptions.SystemSetupError:
+            self.engine = None
+
         # Client options are fetched once during initialization, not on every request.
         self.client_options = self._get_client_options()
         self.base_timeout = int(self.client_options.get("timeout", 10))
@@ -2369,7 +2379,8 @@ class AsyncExecutor:
                 total_ops, total_ops_unit, request_meta_data = await asyncio.wait_for(
                     execute_single(
                         self.runner, self.opensearch, params, self.on_error,
-                        redline_enabled=self.redline_enabled, client_enabled=client_state
+                        redline_enabled=self.redline_enabled, client_enabled=client_state,
+                        engine=self.engine
                     ),
                     timeout=self.base_timeout if request_timeout is None else request_timeout
                 )
@@ -2561,10 +2572,15 @@ class AsyncExecutor:
 request_context_holder = client.RequestContextHolder()
 
 
-async def execute_single(runner, opensearch, params, on_error, redline_enabled=False, client_enabled=True):
+async def execute_single(runner, opensearch, params, on_error, redline_enabled=False, client_enabled=True, engine=None):
     """
     Invokes the given runner once and provides the runner's return value in a uniform structure.
 
+    :param engine: The active engine module (see osbenchmark.engine). When provided, engine-native
+        exceptions that are not opensearchpy transport errors are routed through the engine's optional
+        on_execute_error hook to obtain their (ops, unit, meta, fatal) classification. This restores
+        fatal-connection-error -> abort parity for non-OpenSearch engines and ensures that native
+        exceptions from runners that do not self-catch do not escape uncaught.
     :return: a triple of: total number of operations, unit of operations, a dict of request meta data (may be None).
     """
     # pylint: disable=import-outside-toplevel
@@ -2621,6 +2637,20 @@ async def execute_single(runner, opensearch, params, on_error, redline_enabled=F
             if not redline_enabled:
                 console.error(msg)
                 raise exceptions.SystemSetupError(msg)
+        except Exception as e:  # pylint: disable=broad-except
+            # Engine-native exceptions (e.g. httpx.ConnectError, MilvusException, VespaError) are not
+            # opensearchpy transport errors, so they fall through here. Route them through the active
+            # engine's optional on_execute_error hook to obtain the same (ops, unit, meta, fatal)
+            # classification OpenSearch derives above. This is the sole point where non-self-catching
+            # runners' native exceptions are translated instead of escaping uncaught. If no engine is
+            # provided, or it does not recognize the exception, re-raise to preserve prior behavior.
+            classification = classify_execute_error(engine, e)
+            if classification is None:
+                raise
+            request_context_holder.on_client_request_end()
+            total_ops, total_ops_unit, request_meta_data, engine_fatal = classification
+            if engine_fatal:
+                fatal_error = True
 
         if not request_meta_data["success"]:
             if on_error == "abort" or fatal_error:

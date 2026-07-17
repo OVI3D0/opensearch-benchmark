@@ -116,3 +116,24 @@ def available_engines():
     """Return the list of registered engine names."""
     _ensure_builtin_engines()
     return sorted(_ENGINE_REGISTRY.keys())
+
+
+def classify_execute_error(engine, e):
+    """Route an exception through an engine's optional on_execute_error hook.
+
+    on_execute_error is an optional engine interface member (see the module
+    docstring). It translates an engine-native exception into OSB's
+    (ops, unit, meta, fatal) tuple, where ``meta`` carries ``success: False``
+    and ``fatal`` requests that the run abort.
+
+    :param engine: A registered engine module (may be None).
+    :param e: The caught exception.
+    :return: The engine's (ops, unit, meta, fatal) tuple, or None if the engine
+        is None, does not implement the hook, or does not recognize ``e``.
+    """
+    if engine is None:
+        return None
+    hook = getattr(engine, "on_execute_error", None)
+    if hook is None:
+        return None
+    return hook(e)

@@ -217,7 +217,7 @@ class ClickHouseDatabaseClient(RequestContextHolder):
                    parsed_docs: Optional[List[Dict[str, Any]]] = None,
                    **kwargs: Any) -> Dict:
         from osbenchmark.engine.clickhouse.helpers import (  # pylint: disable=import-outside-toplevel
-            parse_bulk_body, rows_from_docs, docs_have_extra_keys, _ns_to_ms
+            parse_bulk_body, rows_from_docs, docs_have_extra_keys, _ns_to_ms, quote_identifier
         )
         client = await self._ensure_client()
         # If the caller already parsed the body (e.g. ClickHouseBulkIndex parses
@@ -239,7 +239,15 @@ class ClickHouseDatabaseClient(RequestContextHolder):
             # JSONEachRow fallback - schema-flexible, ignores missing/extra columns
             ndjson = "\n".join(_json.dumps(d.get("_source", {})) for d in docs).encode("utf-8")
             try:
-                table_expr = index  # workload passes the table name; may include db.table
+                # Quote the table identifier consistently with delete()/stats()/
+                # forcemerge(). Handle db.table by quoting each part so the dot
+                # separator is preserved (quoting the whole string would treat
+                # "db.table" as a single identifier).
+                if "." in (index or ""):
+                    _db, _tbl = index.split(".", 1)
+                    table_expr = f"{quote_identifier(_db)}.{quote_identifier(_tbl)}"
+                else:
+                    table_expr = quote_identifier(index)
                 summary = await client.command(
                     f"INSERT INTO {table_expr} FORMAT JSONEachRow",
                     data=ndjson,
