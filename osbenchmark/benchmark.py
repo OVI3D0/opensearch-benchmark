@@ -43,7 +43,7 @@ from osbenchmark.synthetic_data_generator import synthetic_data_generator_orches
 from osbenchmark.workload_generator import workload_generator
 from osbenchmark.utils import io, convert, process, console, net, opts, versions
 from osbenchmark import aggregator
-from osbenchmark.database.registry import DatabaseType
+
 
 def create_arg_parser():
     def positive_number(v):
@@ -610,11 +610,9 @@ def create_arg_parser():
         default=opts.ClientOptions.DEFAULT_CLIENT_OPTIONS)
     test_execution_parser.add_argument(
         "--database-type",
-        help="Target database backend. Selects the DatabaseClient adapter used to run "
-             "the workload (default: opensearch). Choices are populated from the "
-             "registered DatabaseType enum.",
-        choices=[d.value for d in DatabaseType],
-        default=DatabaseType.OPENSEARCH.value)
+        help="Define the target database engine (default: opensearch). "
+             "Supported engines: opensearch, vespa, milvus, clickhouse.",
+        default="opensearch")
     test_execution_parser.add_argument("--on-error",
                              choices=["continue", "abort"],
                              help="Controls how OSB behaves on response errors (default: continue).",
@@ -1163,6 +1161,7 @@ def configure_test(arg_parser, args, cfg):
     cfg.add(config.Scope.applicationOverride, "workload", "randomization.alpha", args.randomization_alpha)
     cfg.add(config.Scope.applicationOverride, "workload", "visualize", args.visualize)
     cfg.add(config.Scope.applicationOverride, "workload", "visualize.output.path", args.visualize_output_path)
+    cfg.add(config.Scope.applicationOverride, "database", "type", args.database_type)
     configure_workload_params(arg_parser, args, cfg)
     configure_connection_params(arg_parser, args, cfg)
     configure_telemetry_params(args, cfg)
