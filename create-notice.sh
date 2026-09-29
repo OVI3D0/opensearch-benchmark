@@ -55,6 +55,7 @@ function main {
     add_license "google-resumable-media" "https://raw.githubusercontent.com/googleapis/google-resumable-media-python/master/LICENSE"
     add_license "google-auth" "https://raw.githubusercontent.com/googleapis/google-auth-library-python/master/LICENSE"
     add_license "aiokafka" "https://raw.githubusercontent.com/aio-libs/aiokafka/master/LICENSE"
+    add_license "pymilvus" "https://raw.githubusercontent.com/milvus-io/pymilvus/master/LICENSE"
 
     # transitive dependencies
     # Jinja2 dependencies

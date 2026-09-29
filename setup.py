@@ -202,7 +202,9 @@ setup(name="opensearch-benchmark",
       test_suite="tests",
       tests_require=tests_require,
       extras_require={
-          "develop": tests_require + develop_require
+          "develop": tests_require + develop_require,
+          # License: Apache 2.0
+          "milvus": ["pymilvus>=2.5.0"],
       },
       entry_points={
           "console_scripts": [
