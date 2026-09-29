@@ -5,3 +5,7 @@
 # compatible open source license.
 
 """Milvus client implementation."""
+
+from osbenchmark.database.clients.milvus.client import MilvusClientFactory
+
+__all__ = ["MilvusClientFactory"]
