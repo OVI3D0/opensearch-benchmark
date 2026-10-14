@@ -123,3 +123,21 @@ def test_runs_a_default_pipeline(benchmark_only_pipeline):
     test_execution_orchestrator.run(cfg)
 
     benchmark_only_pipeline.target.assert_called_once_with(cfg)
+
+
+@mock.patch("osbenchmark.metrics.create_test_execution")
+@mock.patch("osbenchmark.workload.load_workload")
+@mock.patch("osbenchmark.test_execution_orchestrator.engine_for")
+def test_setup_rejects_test_procedure_the_engine_cannot_run(engine_for, load_workload, create_test_execution):
+    cfg = config.Config()
+    cfg.add(config.Scope.application, "workload", "test_procedure.name", "default")
+    test_procedure = load_workload.return_value.find_test_procedure_or_default.return_value
+    test_procedure.user_info = None
+    engine_for.return_value.check_test_procedure.side_effect = exceptions.SystemSetupError("unsupported tasks")
+
+    with pytest.raises(exceptions.SystemSetupError, match="unsupported tasks"):
+        test_execution_orchestrator.BenchmarkCoordinator(cfg).setup()
+
+    engine_for.return_value.configure_distribution_version.assert_called_once_with(cfg, sources=False)
+    engine_for.return_value.check_test_procedure.assert_called_once_with(test_procedure)
+    create_test_execution.assert_not_called()
