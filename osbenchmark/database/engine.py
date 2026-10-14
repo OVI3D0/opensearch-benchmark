@@ -9,15 +9,18 @@ The contract every database engine implements.
 
 An engine tells OSB how to talk to one kind of database: how to create its
 clients, how to tell whether it is reachable, which runners execute workload
-operations against it, and which telemetry devices apply to it. The worker
-coordinator and test execution orchestrator only call these methods, so they
-never need to know which engine is selected.
+operations against it, which operations it supports, and which telemetry
+devices apply to it. The worker coordinator and test execution orchestrator
+only call these methods, so they never need to know which engine is selected.
 """
 
 import logging
 from abc import ABC, abstractmethod
 
-from osbenchmark import config
+from osbenchmark import config, exceptions, workload
+
+#: Operation types every engine can run because they never send a request to the database.
+ENGINE_AGNOSTIC_OPERATIONS = frozenset([workload.OperationType.Sleep])
 
 
 class Engine(ABC):
@@ -38,6 +41,10 @@ class Engine(ABC):
     #: Distribution version used to pick the workload branch when the engine
     #: cannot report a version of its own.
     default_distribution_version = "3.0.0"
+
+    #: Whether OSB's built-in runners, which are written against the OpenSearch API, work with this engine.
+    #: Engines that do not use them can only run the operations they provide runners for.
+    uses_default_runners = False
 
     def __init__(self):
         self.logger = logging.getLogger(__name__)
@@ -105,6 +112,55 @@ class Engine(ABC):
                  workload plugin runners, so they take precedence.
         """
         return {}
+
+    def unsupported_operations(self):
+        """
+        :return: Built-in operation types this engine cannot run, although it uses the default runners.
+        """
+        return set()
+
+    def supports_operation(self, operation_type):
+        """
+        :param operation_type: An operation type as written in a workload, e.g. ``bulk``.
+        :return: Whether this engine can run operations of that type. Operation types that are not built in,
+                 such as ones provided by workload plugins, are always considered supported.
+        """
+        try:
+            operation = workload.OperationType.from_hyphenated_string(operation_type)
+        except KeyError:
+            return True
+        if operation in ENGINE_AGNOSTIC_OPERATIONS:
+            return True
+        if self.uses_default_runners:
+            return operation not in self.unsupported_operations()
+        return operation in self._registered_operations()
+
+    def _registered_operations(self):
+        registered = set()
+        for operation_type in self.runners():
+            if isinstance(operation_type, workload.OperationType):
+                registered.add(operation_type)
+            else:
+                try:
+                    registered.add(workload.OperationType.from_hyphenated_string(operation_type))
+                except KeyError:
+                    pass
+        return registered
+
+    def check_test_procedure(self, test_procedure):
+        """
+        :param test_procedure: The test procedure about to run.
+        :raises SystemSetupError: If the test procedure contains operations this engine cannot run.
+        """
+        unsupported = [f"[{task.name}] ({task.operation.type})"
+                       for step in test_procedure.schedule
+                       for task in step
+                       if not self.supports_operation(task.operation.type)]
+        if unsupported:
+            raise exceptions.SystemSetupError(
+                f"Database type [{self.name}] does not support these tasks in test procedure [{test_procedure.name}]: "
+                f"{', '.join(unsupported)}. Remove them with --exclude-tasks, or use a workload written for "
+                f"{self.display_name}.")
 
     def telemetry_devices(self, cfg, clients, metrics_store, workload):
         """

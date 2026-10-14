@@ -24,6 +24,7 @@ class OpenSearchEngine(Engine):
 
     name = "opensearch"
     display_name = "OpenSearch"
+    uses_default_runners = True
 
     def create_client(self, hosts, client_options):
         return osb_client.OsClientFactory(hosts, client_options).create()
