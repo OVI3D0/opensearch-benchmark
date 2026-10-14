@@ -20,7 +20,7 @@ def test_database_runners_override_workload_plugin_runners(
     calls = []
     register_default_runners.side_effect = lambda: calls.append("defaults")
     load_workload_plugins.side_effect = lambda *args: calls.append("workload")
-    engine_for.return_value.register_runners.side_effect = lambda: calls.append("engine")
+    engine_for.return_value.register_runners.side_effect = lambda register_runner: calls.append("engine")
 
     cfg = mock.Mock()
     benchmark_workload = mock.Mock(has_plugins=True)
@@ -30,6 +30,7 @@ def test_database_runners_override_workload_plugin_runners(
 
     assert calls == ["defaults", "workload", "engine"]
     engine_for.assert_called_once_with(cfg)
+    engine_for.return_value.register_runners.assert_called_once_with(worker_coordinator.runner.register_runner)
     load_workload_plugins.assert_called_once_with(
         cfg,
         "vectorsearch",
@@ -48,4 +49,4 @@ def test_skips_workload_plugins_when_workload_has_none(register_default_runners,
 
     register_default_runners.assert_called_once_with()
     load_workload_plugins.assert_not_called()
-    engine_for.return_value.register_runners.assert_called_once_with()
+    engine_for.return_value.register_runners.assert_called_once_with(worker_coordinator.runner.register_runner)

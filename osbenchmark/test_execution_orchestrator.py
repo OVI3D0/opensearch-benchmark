@@ -184,7 +184,8 @@ class BenchmarkCoordinator:
         # to load the workload we need to know the correct cluster distribution version. Usually, this value should be set
         # but there are rare cases (external pipeline and user did not specify the distribution version) where we need
         # to derive it ourselves. For source builds we always assume "master"
-        engine_for(self.cfg).configure_distribution_version(self.cfg, sources=sources)
+        engine = engine_for(self.cfg)
+        engine.configure_distribution_version(self.cfg, sources=sources)
 
         self.current_workload = workload.load_workload(self.cfg)
         self.workload_revision = self.cfg.opts("workload", "repository.revision", mandatory=False)
@@ -194,6 +195,7 @@ class BenchmarkCoordinator:
             raise exceptions.SystemSetupError(
                 "Workload [{}] does not provide test_procedure [{}]. List the available workloads with {} list workloads.".format(
                     self.current_workload.name, test_procedure_name, PROGRAM_NAME))
+        engine.check_test_procedure(self.current_test_procedure)
         if self.current_test_procedure.user_info:
             console.info(self.current_test_procedure.user_info)
 
