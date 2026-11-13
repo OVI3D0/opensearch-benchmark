@@ -78,6 +78,9 @@ function main {
     add_license "botocore" "https://raw.githubusercontent.com/boto/botocore/develop/LICENSE.txt"
     # google-resumable-media dependencies
     add_license "google-crc32c": "https://raw.githubusercontent.com/googleapis/python-crc32c/master/LICENSE"
+
+    # optional database engine clients
+    add_license "clickhouse-connect" "https://raw.githubusercontent.com/ClickHouse/clickhouse-connect/main/LICENSE"
 }
 
 main

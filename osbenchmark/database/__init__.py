@@ -34,8 +34,10 @@ Engines register themselves when this package is imported.
 
 from osbenchmark.database.registry import DEFAULT_ENGINE, engine_for, get_engine, register_engine, registered_engines
 from osbenchmark.database.clients.opensearch import OpenSearchEngine
+from osbenchmark.database.clients.clickhouse import ClickHouseEngine
 
 register_engine(OpenSearchEngine)
+register_engine(ClickHouseEngine)
 
 __all__ = [
     "DEFAULT_ENGINE",

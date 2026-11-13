@@ -152,6 +152,12 @@ tests_require = [
 ]
 
 # These packages are only required when developing OSB
+# Optional database engine clients, installed with e.g. `pip install opensearch-benchmark[clickhouse]`.
+clickhouse_require = [
+    # License: Apache 2.0
+    "clickhouse-connect==1.12.0",
+]
+
 develop_require = [
     "tox==3.14.0",
     "coverage==5.5",
@@ -209,7 +215,8 @@ setup(name="opensearch-benchmark",
       test_suite="tests",
       tests_require=tests_require,
       extras_require={
-          "develop": tests_require + develop_require
+          "develop": tests_require + develop_require + clickhouse_require,
+          "clickhouse": clickhouse_require,
       },
       entry_points={
           "console_scripts": [
